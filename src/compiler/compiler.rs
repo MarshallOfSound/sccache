@@ -149,14 +149,22 @@ pub trait CompilerHasher<T>: fmt::Debug + Send + 'static
 
             // Check the result of the cache lookup.
             Box::new(cache_status.then(move |result| {
+                if let Ok(Some(Cache::HitAndPleaseWrite(mut entry))) = _result {
+                    trace!("cache hit but need to push back into primary cache");
+                    storage.put(&key, entry.to_write()).wait();
+                    _result = Ok(Some(Cache::Hit(entry)));
+                }
+
                 let duration = start.elapsed();
                 let pwd = Path::new(&cwd);
                 let outputs = compilation.outputs()
                     .map(|(key, path)| (key.to_string(), pwd.join(path)))
                     .collect::<HashMap<_, _>>();
 
-                let miss_type = match result {
-                    Ok(Some(Cache::Hit(mut entry))) => {
+                let mut _result = result;
+
+                let miss_type = match _result {
+                    Ok(Some(Cache::Hit(mut entry))) | Ok(Some(Cache::HitAndPleaseWrite(mut entry))) => {
                         debug!("[{}]: Cache hit in {}", out_pretty, fmt_duration_as_secs(&duration));
                         let mut stdout = Vec::new();
                         let mut stderr = Vec::new();

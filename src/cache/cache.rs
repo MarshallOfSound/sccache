@@ -58,6 +58,8 @@ const TEN_GIGS: u64 = 10 * 1024 * 1024 * 1024;
 pub enum Cache {
     /// Result was found in cache.
     Hit(CacheRead),
+    /// Result was found in a cache, and should be written again
+    HitAndPleaseWrite(CacheRead),
     /// Result was not found in cache.
     Miss,
     /// Cache entry should be ignored, force compilation.
@@ -68,6 +70,7 @@ impl fmt::Debug for Cache {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Cache::Hit(_) => write!(f, "Cache::Hit(...)"),
+            Cache::HitAndPleaseWrite(_) => write!(f, "Cache::HitAndPleaseWrite(...)"),
             Cache::Miss => write!(f, "Cache::Miss"),
             Cache::Recache => write!(f, "Cache::Recache"),
         }
@@ -168,6 +171,8 @@ pub trait Storage {
     /// it should return a `Cache::Miss`.
     /// If the entry is successfully found in the cache, it should
     /// return a `Cache::Hit`.
+    /// If the entry is found in a cache that isn't a primary cache
+    /// it should return a `Cache::HitAndPleaseWrite`.
     fn get(&self, key: &str) -> SFuture<Cache>;
 
     /// Put `entry` in the cache under `key`.

@@ -16,6 +16,7 @@ use cache::{
     Cache,
     CacheWrite,
     Storage,
+    CacheRead,
 };
 use cache::disk::DiskCache;
 use futures;
@@ -23,6 +24,7 @@ use futures::future::Future;
 use std::sync::Arc;
 use std::time::{Duration};
 
+use errors;
 use errors::*;
 
 /// A cache that stores entries on disk but can fetch from remote cache or disk.
@@ -44,37 +46,49 @@ impl TwoTierDiskCache {
 
 impl Storage for TwoTierDiskCache {
     fn get(&self, key: &str) -> SFuture<Cache> {
-        let disk_lookup = Box::new(self.disk.get(&key).then(|disk_result| {
-            match disk_result {
-                Ok(data) => {
-                    match data {
-                        Cache::Hit(_) => Ok(data),
-                        _ => Ok(Cache::Miss),
+        let remote_lookup = self.remote.get(&key);
+
+        Box::new(
+            self.disk.get(&key)
+                .then(move |disk_result| {
+                    match disk_result {
+                        Ok(data) => {
+                            match data {
+                                Cache::Hit(_) => Ok(data),
+                                _ => Ok(Cache::Miss),
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Got disk error: {:?}", e);
+                            Ok(Cache::Miss)
+                        }
                     }
-                }
-                Err(e) => {
-                    warn!("Got disk error: {:?}", e);
-                     Ok(Cache::Miss)
-                }
-            }
-        })).wait();
-        let remote_lookup = match disk_lookup {
-            Ok(Cache::Hit(_)) => Box::new(futures::done(disk_lookup)),
-            _ => self.remote.get(&key)
-        };
-        Box::new(remote_lookup.and_then(|cache_status| {
-            match cache_status {
-                Cache::Hit(mut entry) => {
-                    {
-                        let write: CacheWrite = entry.to_write();
-                        // FIXME: Why does this cause a build failure
-                        // self.disk.put(key, entry);
-                        Ok(Cache::Hit(entry))
+                })
+                .and_then(move |disk_status| {
+                    if let Cache::Hit(_) = disk_status {
+                        return Box::new(futures::future::result(Ok(disk_status)))
+                            as Box<futures::Future<Error=errors::Error, Item=Cache>>;
                     }
-                }
-                c => Ok(c),
-            }
-        }))
+
+                    Box::new(remote_lookup
+                        .then(move |remote_status| {
+                            match remote_status {
+                                Ok(Cache::Hit(entry)) => {
+                                    {
+                                        Ok(Cache::HitAndPleaseWrite(entry))
+                                    }
+                                }
+                                _ => remote_status,
+                            }
+                        }))
+                })
+        )
+        
+        // Box::new(futures::done(Ok(Cache::Miss)))
+        // Box::new(
+        //     .and_then(|cache_status| {
+                
+        //     }))
     }
 
     fn put(&self, key: &str, entry: CacheWrite) -> SFuture<Duration> {
