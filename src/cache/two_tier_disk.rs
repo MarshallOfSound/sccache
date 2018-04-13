@@ -62,16 +62,19 @@ impl Storage for TwoTierDiskCache {
             Ok(Cache::Hit(_)) => Box::new(futures::done(disk_lookup)),
             _ => self.remote.get(&key)
         };
-        let cache_status = remote_lookup.wait();
-        let new_cache_status = match cache_status {
-            Ok(Cache::Hit(mut entry)) => {
-                self.put(&key, entry.to_write()).wait();
-                Ok(Cache::Hit(entry))
+        Box::new(remote_lookup.and_then(|cache_status| {
+            match cache_status {
+                Cache::Hit(mut entry) => {
+                    {
+                        let write: CacheWrite = entry.to_write();
+                        // FIXME: Why does this cause a build failure
+                        // self.disk.put(key, entry);
+                        Ok(Cache::Hit(entry))
+                    }
+                }
+                c => Ok(c),
             }
-            Ok(c) => Ok(c),
-            Err(e) => Err(e)
-        };
-        Box::new(futures::done(new_cache_status))
+        }))
     }
 
     fn put(&self, key: &str, entry: CacheWrite) -> SFuture<Duration> {
