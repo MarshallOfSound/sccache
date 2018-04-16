@@ -42,14 +42,11 @@ impl TwoTierDiskCache {
             disk: disk_cache,
         }
     }
-}
 
-impl Storage for TwoTierDiskCache {
-    fn get(&self, key: &str) -> SFuture<Cache> {
-        let remote_lookup = self.remote.get(&key);
-
+    // To get good lifetimes we need to take disk and remote out of self
+    fn _get(&self, key: String, disk: Arc<Storage>, remote: Arc<Storage>) -> SFuture<Cache> {
         Box::new(
-            self.disk.get(&key)
+            disk.get(&key)
                 .then(move |disk_result| {
                     match disk_result {
                         Ok(data) => {
@@ -70,12 +67,16 @@ impl Storage for TwoTierDiskCache {
                             as Box<futures::Future<Error=errors::Error, Item=Cache>>;
                     }
 
-                    Box::new(remote_lookup
+                    Box::new(remote.get(&key)
                         .then(move |remote_status| {
                             match remote_status {
-                                Ok(Cache::Hit(entry)) => {
+                                Ok(Cache::Hit(mut entry)) => {
                                     {
-                                        Ok(Cache::HitAndPleaseWrite(entry))
+                                        trace!("cache hit but need to push back into primary cache");
+                                        // We really don't care if this succeeds or not
+                                        // we just need to try it
+                                        disk.put(&key, entry.to_write());
+                                        Ok(Cache::Hit(entry))
                                     }
                                 }
                                 _ => remote_status,
@@ -83,12 +84,12 @@ impl Storage for TwoTierDiskCache {
                         }))
                 })
         )
-        
-        // Box::new(futures::done(Ok(Cache::Miss)))
-        // Box::new(
-        //     .and_then(|cache_status| {
-                
-        //     }))
+    }
+}
+
+impl Storage for TwoTierDiskCache {
+    fn get(&self, key: &str) -> SFuture<Cache> {
+        self._get(String::from(key), self.disk.clone(), self.remote.clone())
     }
 
     fn put(&self, key: &str, entry: CacheWrite) -> SFuture<Duration> {
