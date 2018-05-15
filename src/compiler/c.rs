@@ -293,7 +293,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
 }
 
 /// The cache is versioned by the inputs to `hash_key`.
-pub const CACHE_VERSION: &[u8] = b"6";
+pub const CACHE_VERSION: &[u8] = b"7";
 
 lazy_static! {
     /// Environment variables that are factored into the cache key.
