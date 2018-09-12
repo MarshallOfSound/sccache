@@ -24,7 +24,7 @@ use cache::redis::RedisCache;
 use cache::s3::S3Cache;
 #[cfg(feature = "gcs")]
 use cache::gcs::{self, GCSCache, GCSCredentialProvider, RWMode};
-use config::{self, CONFIG, CacheType};
+use config::{self, CONFIG, CacheType, TierMode};
 use futures_cpupool::CpuPool;
 #[cfg(feature = "gcs")]
 use serde_json;
@@ -178,6 +178,20 @@ pub trait Storage {
 }
 
 pub fn storage_from_config(pool: &CpuPool, _handle: &Handle) -> Arc<Storage> {
+    let primary: Arc<Storage> = primary_from_config(pool, _handle);
+    trace!("Obtained Primary Cache");
+    if CONFIG.tier_mode == TierMode::TwoTier {
+        info!("Two tier mode activated, using disk cache as second tier");
+        let (dir, size) = (&CONFIG.fallback_cache.dir, CONFIG.fallback_cache.size);
+        trace!("Using DiskCache({:?}, {})", dir, size);
+        return Arc::new(TwoTierDiskCache::new(primary, Arc::new(DiskCache::new(dir, size, pool))));
+    } else {
+        trace!("Using Single Tier Mode");
+    }
+    primary
+}
+
+pub fn primary_from_config(pool: &CpuPool, _handle: &Handle) -> Arc<Storage> {
     for cache_type in CONFIG.caches.iter() {
         match *cache_type {
             CacheType::Azure(config::AzureCacheConfig) => {

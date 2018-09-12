@@ -149,14 +149,30 @@ pub struct CacheConfigs {
     memcached: Option<MemcachedCacheConfig>,
     redis: Option<RedisCacheConfig>,
     s3: Option<S3CacheConfig>,
+    tier_mode: TierMode,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+pub enum TierMode {
+    #[serde(rename = "TWO_TIER")]
+    TwoTier,
+    #[serde(rename = "SINGLE_TIER")]
+    SingleTier,
+}
+
+impl Default for TierMode {
+    fn default() -> Self {
+        TierMode::SingleTier
+    }
 }
 
 impl CacheConfigs {
     /// Return a vec of the available cache types in an arbitrary but
     /// consistent ordering
-    fn into_vec_and_fallback(self) -> (Vec<CacheType>, DiskCacheConfig) {
+    fn into_vec_and_fallback(self) -> (Vec<CacheType>, DiskCacheConfig, TierMode) {
         let CacheConfigs {
-            azure, disk, gcs, memcached, redis, s3
+            azure, disk, gcs, memcached, redis, s3, tier_mode
         } = self;
 
         let caches = s3.map(CacheType::S3).into_iter()
@@ -167,13 +183,13 @@ impl CacheConfigs {
             .collect();
         let fallback = disk.unwrap_or_else(Default::default);
 
-        (caches, fallback)
+        (caches, fallback, tier_mode)
     }
 
     /// Override self with any existing fields from other
     fn merge(&mut self, other: Self) {
         let CacheConfigs {
-            azure, disk, gcs, memcached, redis, s3
+            azure, disk, gcs, memcached, redis, s3, tier_mode
         } = other;
 
         if azure.is_some()     { self.azure = azure }
@@ -182,6 +198,7 @@ impl CacheConfigs {
         if memcached.is_some() { self.memcached = memcached }
         if redis.is_some()     { self.redis = redis }
         if s3.is_some()        { self.s3 = s3 }
+        if tier_mode == TierMode::TwoTier { self.tier_mode = TierMode::TwoTier }
     }
 }
 
@@ -324,6 +341,14 @@ fn config_from_env() -> EnvConfig {
             DiskCacheConfig { dir, size }
         });
 
+    let mut tier_mode: TierMode = TierMode::SingleTier;
+
+    trace!("Defaulting Single Tier");
+    if env::var("SCCACHE_TWO_TIER").is_ok() {
+        trace!("Using Two Tier Mode");
+        tier_mode = TierMode::TwoTier;
+    }
+
     let cache = CacheConfigs {
         azure,
         disk,
@@ -331,6 +356,7 @@ fn config_from_env() -> EnvConfig {
         memcached,
         redis,
         s3,
+        tier_mode,
     };
 
     EnvConfig { cache }
@@ -341,6 +367,7 @@ pub struct Config {
     pub caches: Vec<CacheType>,
     pub fallback_cache: DiskCacheConfig,
     pub dist: DistConfig,
+    pub tier_mode: TierMode,
 }
 
 impl Config {
@@ -376,8 +403,8 @@ impl Config {
         let EnvConfig { cache } = env_conf;
         conf_caches.merge(cache);
 
-        let (caches, fallback_cache) = conf_caches.into_vec_and_fallback();
-        Config { caches, fallback_cache, dist }
+        let (caches, fallback_cache, tier_mode) = conf_caches.into_vec_and_fallback();
+        Config { caches, fallback_cache, tier_mode, dist }
     }
 }
 
@@ -403,6 +430,7 @@ fn config_overrides() {
             redis: Some(RedisCacheConfig {
                 url: "myotherredisurl".to_owned(),
             }),
+            tier_mode: TierMode::SingleTier,
             ..Default::default()
         },
     };
@@ -419,6 +447,7 @@ fn config_overrides() {
             redis: Some(RedisCacheConfig {
                 url: "myredisurl".to_owned(),
             }),
+            tier_mode: TierMode::SingleTier,
             ..Default::default()
         },
         dist: Default::default(),
