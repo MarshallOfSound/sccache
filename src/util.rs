@@ -12,21 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::{Future, IntoFuture};
+use bincode;
+use byteorder::{ByteOrder, BigEndian};
+use futures::Future;
 use futures_cpupool::CpuPool;
 use mock_command::{CommandChild, RunCommand};
 use ring::digest::{SHA512, Context};
+use serde::Serialize;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::hash::Hasher;
 use std::io::BufReader;
 use std::io::prelude::*;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::{self,Stdio};
 use std::time::Duration;
 
 use errors::*;
 
+#[derive(Clone)]
 pub struct Digest {
     inner: Context,
 }
@@ -39,13 +43,17 @@ impl Digest {
     /// Calculate the SHA-512 digest of the contents of `path`, running
     /// the actual hash computation on a background thread in `pool`.
     pub fn file<T>(path: T, pool: &CpuPool) -> SFuture<String>
-        where T: Into<PathBuf>
+        where T: AsRef<Path>
     {
-        let path = path.into();
+        let path = path.as_ref();
+        let f = ftry!(File::open(&path).chain_err(|| format!("Failed to open file for hashing: {:?}", path)));
+        Self::reader(f, pool)
+    }
+
+    pub fn reader<R: Read + Send + 'static>(rdr: R, pool: &CpuPool) -> SFuture<String> {
         Box::new(pool.spawn_fn(move || -> Result<_> {
-            let f = File::open(&path).chain_err(|| format!("Failed to open file for hashing: {:?}", path))?;
             let mut m = Digest::new();
-            let mut reader = BufReader::new(f);
+            let mut reader = BufReader::new(rdr);
             loop {
                 let mut buffer = [0; 1024];
                 let count = reader.read(&mut buffer[..])?;
@@ -67,7 +75,7 @@ impl Digest {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
         s.push(hex(byte & 0xf));
@@ -111,7 +119,7 @@ fn wait_with_input_output<T>(mut child: T, input: Option<Vec<u8>>)
     });
 
     // Finish writing stdin before waiting, because waiting drops stdin.
-    let status = Future::and_then(stdin.into_future(), |io| {
+    let status = Future::and_then(stdin, |io| {
         drop(io);
         child.wait().chain_err(|| "failed to wait for child")
     });
@@ -152,6 +160,20 @@ pub fn run_input_output<C>(mut command: C, input: Option<Vec<u8>>)
                      }
                  })
              }))
+}
+
+/// Write `data` to `writer` with bincode serialization, prefixed by a `u32` length.
+pub fn write_length_prefixed_bincode<W, S>(mut writer: W, data: S) -> Result<()>
+    where W: Write,
+          S: Serialize,
+{
+    let bytes = bincode::serialize(&data)?;
+    let mut len = [0; 4];
+    BigEndian::write_u32(&mut len, bytes.len() as u32);
+    writer.write_all(&len)?;
+    writer.write_all(&bytes)?;
+    writer.flush()?;
+    Ok(())
 }
 
 pub trait OsStrExt {
@@ -268,6 +290,11 @@ impl<'a> Hasher for HashToDigest<'a> {
     fn finish(&self) -> u64 {
         panic!("not supposed to be called");
     }
+}
+
+/// Turns a slice of environment var tuples into the type expected by Command::envs.
+pub fn ref_env(env: &[(OsString, OsString)]) -> impl Iterator<Item = (&OsString, &OsString)> {
+    env.iter().map(|&(ref k, ref v)| (k, v))
 }
 
 #[cfg(test)]

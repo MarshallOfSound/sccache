@@ -45,8 +45,6 @@
 //! then create an `Arc<Mutex<MockCommandCreator>>` and safely provide
 //! `MockChild` outputs.
 
-#[cfg(unix)]
-use libc;
 use errors::*;
 use futures::future::{self, Future};
 use jobserver::{Acquired, Client};
@@ -226,11 +224,7 @@ impl RunCommand for AsyncCommand {
     fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
         where I: IntoIterator<Item=(K, V)>, K: AsRef<OsStr>, V: AsRef<OsStr>
     {
-        //TODO: when Command::envs stabilizes, use that:
-        // https://github.com/rust-lang/rust/issues/38526
-        for (k, v) in vars {
-            self.inner().env(k, v);
-        }
+        self.inner().envs(vars);
         self
     }
     fn env_clear(&mut self) -> &mut AsyncCommand {
@@ -275,7 +269,7 @@ impl RunCommand for AsyncCommand {
         self.jobserver.configure(&mut inner);
         let handle = self.handle.clone();
         Box::new(self.jobserver.acquire().and_then(move |token| {
-            let child = inner.spawn_async(&handle).chain_err(|| {
+            let child = inner.spawn_async_with_handle(handle.new_tokio_handle()).chain_err(|| {
                 format!("failed to spawn {:?}", inner)
             })?;
             Ok(Child { inner: child, token: token })
@@ -327,20 +321,18 @@ impl CommandCreatorSync for ProcessCommandCreator {
 }
 
 #[cfg(unix)]
-pub type ExitStatusValue = libc::c_int;
-
+use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
-// DWORD
+use std::os::windows::process::ExitStatusExt;
+
+#[cfg(unix)]
+pub type ExitStatusValue = i32;
+#[cfg(windows)]
 pub type ExitStatusValue = u32;
 
 #[allow(dead_code)]
-struct InnerExitStatus(ExitStatusValue);
-
-/// Hack until `ExitStatus::from_raw()` is stable.
-#[allow(dead_code)]
 pub fn exit_status(v : ExitStatusValue) -> ExitStatus {
-    use std::mem::transmute;
-    unsafe { transmute(InnerExitStatus(v)) }
+    ExitStatus::from_raw(v)
 }
 
 /// A struct that mocks `std::process::Child`.
@@ -540,7 +532,6 @@ impl<T: CommandCreator + 'static> CommandCreatorSync for Arc<Mutex<T>> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::error::Error;
     use std::ffi::OsStr;
     use std::io;
     use jobserver::Client;

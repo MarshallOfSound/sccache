@@ -1,6 +1,6 @@
 [package]
 name = "sccache"
-version = "0.2.7-electron.0"
+version = "0.2.8-electron.0"
 authors = ["Ted Mielczarek <ted@mielczarek.org>", "Alex Crichton <alex@alexcrichton.com>"]
 license = "Apache-2.0"
 description = "Sccache is a ccache-like tool. It is used as a compiler wrapper and avoids compilation when possible, storing a cache in a remote storage using the S3 API."
@@ -13,69 +13,91 @@ keywords = ["ccache"]
 travis-ci = { repository = "mozilla/sccache" }
 appveyor = { repository = "mozilla/sccache" }
 
+[[bin]]
+name = "sccache"
+
+[[bin]]
+name = "sccache-dist"
+required-features = ["dist-server"]
+
 [dependencies]
+ar = { version = "0.6", optional = true }
+atty = "0.2.6"
 base64 = "0.9.0"
-bincode = "0.9"
+bincode = "1"
 byteorder = "1.0"
-chrono = { version = "0.3", optional = true }
+bytes = "0.4"
+chrono = { version = "0.4", optional = true }
 clap = "2.23.0"
-env_logger = "0.4"
-error-chain = { version = "0.11", default-features = false }
-filetime = "0.1"
+directories = "1"
+env_logger = "0.5"
+error-chain = { version = "0.12", default-features = false }
+filetime = "0.2"
+flate2 = { version = "1.0", optional = true, default-features = false, features = ["rust_backend"] }
 futures = "0.1.11"
 futures-cpupool = "0.1"
 hyper = { version = "0.11", optional = true }
-hyper-tls = { version = "0.1", optional = true }
 jobserver = "0.1"
-jsonwebtoken = { version = "4.0", optional = true }
+jsonwebtoken = { version = "5.0", optional = true }
+lazy_static = "1.0.0"
 libc = "0.2.10"
 local-encoding = "0.2.0"
-log = "0.3.6"
+log = "0.4"
 lru-disk-cache = { path = "lru-disk-cache", version = "0.2.0" }
-memcached-rs = { version = "0.1" , optional = true }
-native-tls = "0.1"
+memcached-rs = { version = "0.3" , optional = true }
 num_cpus = "1.0"
 number_prefix = "0.2.5"
-openssl = { version = "0.9", optional = true }
-redis = { version = "0.8.0", optional = true }
-regex = "0.2"
+openssl = { version = "0.10", optional = true }
+rand = "0.5"
+redis = { version = "0.9.0", optional = true }
+regex = "1"
+# Exact dependency since we use the unstable async API
+reqwest = { version = "=0.8.8", features = ["unstable"], optional = true }
 retry = "0.4.0"
-ring = "0.12.1"
+ring = "0.13.2"
 rust-crypto = { version = "0.2.36", optional = true }
 serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
 strip-ansi-escapes = "0.1"
+tar = "0.4"
 tempdir = "0.3.4"
-tempfile = "2.1.5"
+tempfile = "3"
 time = "0.1.35"
 tokio-core = "0.1.6"
 tokio-io = "0.1"
-tokio-process = "0.1"
+tokio-process = "0.2"
 tokio-proto = "0.1"
 tokio-serde-bincode = "0.1"
 tokio-service = "0.1"
-tokio-tls = "0.1"
+toml = "0.4"
 uuid = { version = "0.6", features = ["v4"] }
 url = { version = "1.0", optional = true }
-which = "1.0"
-zip = { version = "=0.2.3", default-features = false }
-lazy_static = "1.0.0"
-atty = "0.2.6"
-directories = "0.8.4"
+walkdir = "1.0.7"
+which = "2"
+zip = { version = "0.4", default-features = false, features = ["deflate"] }
+
+# dist-server only
+arraydeque = { version = "0.4", optional = true }
+crossbeam-utils = { version = "0.5", optional = true }
+libmount = { version = "0.1.10", optional = true }
+nix = { version = "0.11.0", optional = true }
+rouille = { version = "2.2", optional = true, default-features = false }
 
 [dev-dependencies]
-assert_cli = "0.5"
+assert_cmd = "0.9"
 cc = "1.0"
+chrono = "0.4"
 itertools = "0.7"
+predicates = "0.9.0"
 
 [target.'cfg(unix)'.dependencies]
-daemonize = "0.2.3"
-tokio-uds = "0.1"
+daemonize = "0.3"
+tokio-uds = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 kernel32-sys = "0.2.2"
-winapi = "0.2"
+winapi = { version = "0.3", features = ["winnls"] }
 mio-named-pipes = "0.1"
 
 [features]
@@ -83,13 +105,18 @@ default = ["s3"]
 all = ["redis", "s3", "memcached", "gcs", "azure"]
 # gcs requires openssl, which is a pain on Windows.
 all-windows = ["redis", "s3", "memcached", "azure"]
-azure = ["chrono", "hyper", "hyper-tls", "rust-crypto"]
-s3 = ["chrono", "hyper", "hyper-tls", "rust-crypto", "simple-s3"]
+azure = ["chrono", "hyper", "rust-crypto", "url"]
+s3 = ["chrono", "hyper", "reqwest", "rust-crypto", "simple-s3"]
 simple-s3 = []
-gcs = ["chrono", "hyper", "hyper-tls", "jsonwebtoken", "openssl", "url"]
+gcs = ["chrono", "hyper", "jsonwebtoken", "openssl", "url"]
 memcached = ["memcached-rs"]
 # Enable features that require unstable features of Nightly Rust.
 unstable = []
+# Enables distributed support in the sccache client
+dist-client = ["ar", "flate2", "reqwest"]
+# Enables the sccache-dist binary
+dist-server = ["arraydeque", "crossbeam-utils", "jsonwebtoken", "flate2", "libmount", "nix", "reqwest", "rouille"]
 
 [workspace]
 exclude = ["tests/test-crate"]
+

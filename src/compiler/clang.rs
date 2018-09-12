@@ -18,11 +18,13 @@ use ::compiler::{
     gcc,
     Cacheable,
     CompilerArguments,
+    CompileCommand,
     write_temp_file,
 };
+use dist;
 use compiler::args::*;
 use compiler::c::{CCompilerImpl, CCompilerKind, Language, ParsedArguments};
-use compiler::gcc::GCCArgAttribute::*;
+use compiler::gcc::ArgData::*;
 use futures::future::{self, Future};
 use futures_cpupool::CpuPool;
 use mock_command::{
@@ -36,7 +38,7 @@ use std::io::{
     self,
     Write,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 use util::{run_input_output, OsStrExt};
 
@@ -60,34 +62,39 @@ impl CCompilerImpl for Clang {
                      executable: &Path,
                      parsed_args: &ParsedArguments,
                      cwd: &Path,
-                     env_vars: &[(OsString, OsString)])
+                     env_vars: &[(OsString, OsString)],
+                     may_dist: bool)
                      -> SFuture<process::Output> where T: CommandCreatorSync
     {
-        gcc::preprocess(creator, executable, parsed_args, cwd, env_vars)
+        gcc::preprocess(creator, executable, parsed_args, cwd, env_vars, may_dist)
     }
 
-    fn compile<T>(&self,
-                  creator: &T,
-                  executable: &Path,
-                  parsed_args: &ParsedArguments,
-                  cwd: &Path,
-                  env_vars: &[(OsString, OsString)])
-                  -> SFuture<(Cacheable, process::Output)>
-        where T: CommandCreatorSync
+    fn generate_compile_commands(&self,
+                                path_transformer: &mut dist::PathTransformer,
+                                executable: &Path,
+                                parsed_args: &ParsedArguments,
+                                cwd: &Path,
+                                env_vars: &[(OsString, OsString)])
+                                -> Result<(CompileCommand, Option<dist::CompileCommand>, Cacheable)>
     {
-        gcc::compile(creator, executable, parsed_args, cwd, env_vars)
+        gcc::generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars)
     }
 }
 
-static ARGS: [(ArgInfo, gcc::GCCArgAttribute); 8] = [
-    take_arg!("--serialize-diagnostics", String, Separated, PassThrough),
-    take_arg!("--target", String, Separated, PassThrough),
-    take_arg!("-Xclang", String, Separated, PassThrough),
-    flag!("-fcxx-modules", TooHard),
-    flag!("-fmodules", TooHard),
-    take_arg!("-gcc-toolchain", String, Separated, PassThrough),
-    take_arg!("-include-pch", Path, CanBeSeparated, PreprocessorArgument),
-    take_arg!("-target", String, Separated, PassThrough),
+pub static ARGS: [ArgInfo<gcc::ArgData>; 10] = [
+    take_arg!("--serialize-diagnostics", OsString, Separated, PassThrough),
+    take_arg!("--target", OsString, Separated, PassThrough),
+    // TODO: should be extracted and reprocessed, though bear in mind some
+    // flags are not valid under a -Xclang
+    take_arg!("-Xclang", OsString, Separated, TooHard),
+    flag!("-fcxx-modules", TooHardFlag),
+    flag!("-fmodules", TooHardFlag),
+    flag!("-fprofile-instr-generate", ProfileGenerate),
+    // Can be either -fprofile-instr-use or -fprofile-instr-use=path
+    take_arg!("-fprofile-instr-use", OsString, Concatenated, TooHard),
+    take_arg!("-gcc-toolchain", OsString, Separated, PassThrough),
+    take_arg!("-include-pch", PathBuf, CanBeSeparated, PreprocessorArgumentPath),
+    take_arg!("-target", OsString, Separated, PassThrough),
 ];
 
 #[cfg(test)]
@@ -143,7 +150,6 @@ mod test {
 
     #[test]
     fn test_parse_arguments_others() {
-        parses!("-c", "foo.c", "-Xclang", "-load", "-Xclang", "moz-check", "-o", "foo.o");
         parses!("-c", "foo.c", "-B", "somewhere", "-o", "foo.o");
         parses!("-c", "foo.c", "-target", "x86_64-apple-darwin11", "-o", "foo.o");
         parses!("-c", "foo.c", "-gcc-toolchain", "somewhere", "-o", "foo.o");
@@ -151,9 +157,9 @@ mod test {
 
     #[test]
     fn test_parse_arguments_clangmodules() {
-        assert_eq!(CompilerArguments::CannotCache("-fcxx-modules"),
+        assert_eq!(CompilerArguments::CannotCache("-fcxx-modules", None),
                    _parse_arguments(&stringvec!["-c", "foo.c", "-fcxx-modules", "-o", "foo.o"]));
-        assert_eq!(CompilerArguments::CannotCache("-fmodules"),
+        assert_eq!(CompilerArguments::CannotCache("-fmodules", None),
                    _parse_arguments(&stringvec!["-c", "foo.c", "-fmodules", "-o", "foo.o"]));
     }
 }

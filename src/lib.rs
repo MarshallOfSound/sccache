@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![recursion_limit="128"]
+#![recursion_limit = "128"]
 
+#[cfg(feature = "ar")]
+extern crate ar;
 extern crate atty;
 extern crate base64;
 extern crate bincode;
 extern crate byteorder;
+extern crate bytes;
 #[cfg(feature = "chrono")]
 extern crate chrono;
 #[macro_use]
@@ -31,13 +34,15 @@ extern crate env_logger;
 #[macro_use]
 extern crate error_chain;
 extern crate filetime;
+#[cfg(feature = "flate2")]
+extern crate flate2;
 #[macro_use]
 extern crate futures;
 extern crate futures_cpupool;
 #[cfg(feature = "hyper")]
 extern crate hyper;
-#[cfg(feature = "hyper-tls")]
-extern crate hyper_tls;
+#[cfg(test)]
+extern crate itertools;
 #[cfg(feature = "jsonwebtoken")]
 extern crate jsonwebtoken as jwt;
 #[cfg(windows)]
@@ -47,28 +52,33 @@ extern crate lazy_static;
 extern crate local_encoding;
 #[macro_use]
 extern crate log;
-extern crate lru_disk_cache;
-#[cfg(test)]
-extern crate itertools;
 extern crate libc;
+extern crate lru_disk_cache;
 #[cfg(feature = "memcached")]
 extern crate memcached;
 #[cfg(windows)]
 extern crate mio_named_pipes;
-extern crate native_tls;
 extern crate num_cpus;
 extern crate number_prefix;
 #[cfg(feature = "openssl")]
 extern crate openssl;
+extern crate rand;
 extern crate ring;
 #[cfg(feature = "redis")]
 extern crate redis;
 extern crate regex;
+#[cfg(feature = "reqwest")]
+extern crate reqwest;
 extern crate retry;
+#[cfg(feature = "rouille")]
+#[macro_use(router)]
+extern crate rouille;
+extern crate serde;
 extern crate serde_json;
 #[macro_use]
 extern crate serde_derive;
 extern crate strip_ansi_escapes;
+extern crate tar;
 extern crate tempdir;
 extern crate tempfile;
 extern crate time;
@@ -76,14 +86,16 @@ extern crate tokio_core;
 extern crate tokio_io;
 extern crate tokio_process;
 extern crate tokio_proto;
-extern crate tokio_service;
 extern crate tokio_serde_bincode;
-#[cfg(feature = "gcs")]
+extern crate tokio_service;
+extern crate toml;
+#[cfg(any(feature = "gcs", feature = "azure"))]
 extern crate url;
 extern crate uuid;
+extern crate walkdir;
+extern crate which;
 #[cfg(windows)]
 extern crate winapi;
-extern crate which;
 extern crate zip;
 
 // To get macros in scope, this has to be first.
@@ -92,7 +104,7 @@ extern crate zip;
 mod test;
 
 #[macro_use]
-mod errors;
+pub mod errors;
 
 #[cfg(feature = "azure")]
 mod azure;
@@ -101,10 +113,12 @@ mod client;
 mod cmdline;
 mod commands;
 mod compiler;
+pub mod config;
+pub mod dist;
 mod jobserver;
 mod mock_command;
 mod protocol;
-mod server;
+pub mod server;
 #[cfg(feature = "simple-s3")]
 mod simples3;
 mod util;
@@ -114,21 +128,21 @@ use std::io::Write;
 
 pub fn main() {
     init_logging();
+    // Initialise config
+    let _ = config::CONFIG.caches.len();
     std::process::exit(match cmdline::parse() {
-        Ok(cmd) => {
-            match commands::run_command(cmd) {
-                Ok(s) => s,
-                Err(e) =>  {
-                    let stderr = &mut std::io::stderr();
-                    writeln!(stderr, "error: {}", e).unwrap();
+        Ok(cmd) => match commands::run_command(cmd) {
+            Ok(s) => s,
+            Err(e) => {
+                let stderr = &mut std::io::stderr();
+                writeln!(stderr, "error: {}", e).unwrap();
 
-                    for e in e.iter().skip(1) {
-                        writeln!(stderr, "caused by: {}", e).unwrap();
-                    }
-                    2
+                for e in e.iter().skip(1) {
+                    writeln!(stderr, "caused by: {}", e).unwrap();
                 }
+                2
             }
-        }
+        },
         Err(e) => {
             println!("sccache: {}", e);
             cmdline::get_app().print_help().unwrap();
@@ -140,7 +154,7 @@ pub fn main() {
 
 fn init_logging() {
     if env::var("RUST_LOG").is_ok() {
-        match env_logger::init() {
+        match env_logger::try_init() {
             Ok(_) => (),
             Err(e) => panic!(format!("Failed to initalize logging: {:?}", e)),
         }

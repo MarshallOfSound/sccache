@@ -43,6 +43,13 @@ macro_rules! ovec {
     };
 }
 
+/// Return a `Vec` with each listed entry converted to an owned `PathBuf`.
+macro_rules! pathvec {
+    ( $( $x:expr ),* ) => {
+        vec!($( ::std::path::PathBuf::from($x), )*)
+    };
+}
+
 /// Assert that `left != right`.
 macro_rules! assert_neq {
     ($left:expr , $right:expr) => ({
@@ -85,6 +92,7 @@ pub fn next_command_calls<C: Fn(&[OsString]) -> Result<MockChild> + Send + 'stat
     creator.lock().unwrap().next_command_calls(call);
 }
 
+#[cfg(not(target_os="macos"))]
 pub fn find_sccache_binary() -> PathBuf {
     // Older versions of cargo put the test binary next to the sccache binary.
     // Newer versions put it in the deps/ subdirectory.

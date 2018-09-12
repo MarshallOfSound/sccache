@@ -8,7 +8,9 @@ matrix:
     - os: osx
 
     # rustc version compat
-    - rust: 1.22.0 # oldest supported version, keep in sync with README.md
+    - rust: 1.27.0 # oldest supported version, keep in sync with README.md
+    - rust: 1.27.0
+      env: DIST_SCCACHE=1
     - rust: beta
     - rust: nightly
 
@@ -28,9 +30,11 @@ matrix:
 
 before_script:
   - if [[ "${TRAVIS_RUST_VERSION}" = "nightly" ]]; then export EXTRA_FEATURES=unstable; fi
+  - if [[ "${DIST_SCCACHE}" = "1" ]]; then export EXTRA_FEATURES="dist-client dist-server"; fi
 
 script:
   - cargo build --verbose --features="all ${EXTRA_FEATURES}"
+  - RUST_BACKTRACE=1 cargo test --all --verbose --no-default-features --features="${EXTRA_FEATURES}"
   - RUST_BACKTRACE=1 cargo test --all --verbose --features="all ${EXTRA_FEATURES}"
 
 before_deploy:

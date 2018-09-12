@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use compiler::{Cacheable, ColorMode, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
+use compiler::{Cacheable, ColorMode, Compiler, CompilerArguments, CompileCommand, CompilerHasher, CompilerKind,
                Compilation, HashResult};
+use dist;
+#[cfg(feature = "dist-client")]
+use dist::pkg;
 use futures::Future;
 use futures_cpupool::CpuPool;
 use mock_command::CommandCreatorSync;
@@ -22,7 +25,12 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+#[cfg(feature = "dist-client")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::fs;
 use std::hash::Hash;
+#[cfg(feature = "dist-client")]
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::str;
@@ -77,7 +85,7 @@ pub struct ParsedArguments {
     pub common_args: Vec<OsString>,
     /// Whether or not the `-showIncludes` argument is passed on MSVC
     pub msvc_show_includes: bool,
-    /// Whether the compilation is generating profiling data.
+    /// Whether the compilation is generating profiling or coverage data.
     pub profile_generate: bool,
 }
 
@@ -117,8 +125,12 @@ impl Language {
 /// A generic implementation of the `Compilation` trait for C/C++ compilers.
 struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
+    #[cfg(feature = "dist-client")]
+    preprocessed_input: Vec<u8>,
     executable: PathBuf,
     compiler: I,
+    cwd: PathBuf,
+    env_vars: Vec<(OsString, OsString)>,
 }
 
 /// Supported C compilers.
@@ -146,18 +158,18 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + 'static {
                      executable: &Path,
                      parsed_args: &ParsedArguments,
                      cwd: &Path,
-                     env_vars: &[(OsString, OsString)])
+                     env_vars: &[(OsString, OsString)],
+                     may_dist: bool)
                      -> SFuture<process::Output> where T: CommandCreatorSync;
-    /// Run the C compiler with the specified set of arguments, using the
-    /// previously-generated `preprocessor_output` as input if possible.
-    fn compile<T>(&self,
-                  creator: &T,
-                  executable: &Path,
-                  parsed_args: &ParsedArguments,
-                  cwd: &Path,
-                  env_vars: &[(OsString, OsString)])
-                  -> SFuture<(Cacheable, process::Output)>
-        where T: CommandCreatorSync;
+    /// Generate a command that can be used to invoke the C compiler to perform
+    /// the compilation.
+    fn generate_compile_commands(&self,
+                                path_transformer: &mut dist::PathTransformer,
+                                executable: &Path,
+                                parsed_args: &ParsedArguments,
+                                cwd: &Path,
+                                env_vars: &[(OsString, OsString)])
+                                -> Result<(CompileCommand, Option<dist::CompileCommand>, Cacheable)>;
 }
 
 impl <I> CCompiler<I>
@@ -189,7 +201,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
                     compiler: self.compiler.clone(),
                 }))
             }
-            CompilerArguments::CannotCache(why) => CompilerArguments::CannotCache(why),
+            CompilerArguments::CannotCache(why, extra_info) => CompilerArguments::CannotCache(why, extra_info),
             CompilerArguments::NotCompilation => CompilerArguments::NotCompilation,
         }
     }
@@ -205,14 +217,15 @@ impl<T, I> CompilerHasher<T> for CCompilerHasher<I>
 {
     fn generate_hash_key(self: Box<Self>,
                          creator: &T,
-                         cwd: &Path,
-                         env_vars: &[(OsString, OsString)],
+                         cwd: PathBuf,
+                         env_vars: Vec<(OsString, OsString)>,
+                         may_dist: bool,
                          _pool: &CpuPool)
-                         -> SFuture<HashResult<T>>
+                         -> SFuture<HashResult>
     {
         let me = *self;
         let CCompilerHasher { parsed_args, executable, executable_digest, compiler } = me;
-        let result = compiler.preprocess(creator, &executable, &parsed_args, cwd, env_vars);
+        let result = compiler.preprocess(creator, &executable, &parsed_args, &cwd, &env_vars, may_dist);
         let out_pretty = parsed_args.output_pretty().into_owned();
         let env_vars = env_vars.to_vec();
         let result = result.map_err(move |e| {
@@ -247,13 +260,22 @@ impl<T, I> CompilerHasher<T> for CCompilerHasher<I>
                          &env_vars,
                          &preprocessor_result.stdout)
             };
+            // A compiler binary may be a symlink to another and so has the same digest, but that means
+            // the toolchain will not contain the correct path to invoke the compiler! Add the compiler
+            // executable path to try and prevent this
+            let weak_toolchain_key = format!("{}-{}", executable.to_string_lossy(), executable_digest);
             Ok(HashResult {
                 key: key,
                 compilation: Box::new(CCompilation {
                     parsed_args: parsed_args,
+                    #[cfg(feature = "dist-client")]
+                    preprocessed_input: preprocessor_result.stdout,
                     executable: executable,
                     compiler: compiler,
+                    cwd,
+                    env_vars,
                 }),
+                weak_toolchain_key,
             })
         }))
     }
@@ -274,21 +296,90 @@ impl<T, I> CompilerHasher<T> for CCompilerHasher<I>
     }
 }
 
-impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I> {
-    fn compile(self: Box<Self>,
-               creator: &T,
-               cwd: &Path,
-               env_vars: &[(OsString, OsString)])
-               -> SFuture<(Cacheable, process::Output)>
+impl<I: CCompilerImpl> Compilation for CCompilation<I> {
+    fn generate_compile_commands(&self, path_transformer: &mut dist::PathTransformer)
+                                -> Result<(CompileCommand, Option<dist::CompileCommand>, Cacheable)>
     {
-        let me = *self;
-        let CCompilation { parsed_args, executable, compiler } = me;
-        compiler.compile(creator, &executable, &parsed_args, cwd, env_vars)
+        let CCompilation { ref parsed_args, ref executable, ref compiler, ref cwd, ref env_vars, .. } = *self;
+        compiler.generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars)
+    }
+
+    #[cfg(feature = "dist-client")]
+    fn into_dist_packagers(self: Box<Self>, path_transformer: &mut dist::PathTransformer) -> Result<(Box<pkg::InputsPackager>, Box<pkg::ToolchainPackager>)> {
+        let CCompilation { parsed_args, cwd, preprocessed_input, executable, .. } = *{self};
+        trace!("Dist inputs: {:?}", parsed_args.input);
+
+        let input_path = cwd.join(&parsed_args.input);
+        let input_path = pkg::simplify_path(&input_path)?;
+        let dist_input_path = path_transformer.to_dist(&input_path).unwrap();
+
+        let inputs_packager = Box::new(CInputsPackager { input_path, dist_input_path, preprocessed_input });
+        let toolchain_packager = Box::new(CToolchainPackager { executable });
+        Ok((inputs_packager, toolchain_packager))
     }
 
     fn outputs<'a>(&'a self) -> Box<Iterator<Item=(&'a str, &'a Path)> + 'a>
     {
         Box::new(self.parsed_args.outputs.iter().map(|(k, v)| (*k, &**v)))
+    }
+}
+
+#[cfg(feature = "dist-client")]
+struct CInputsPackager {
+    input_path: PathBuf,
+    dist_input_path: String,
+    preprocessed_input: Vec<u8>,
+}
+
+#[cfg(feature = "dist-client")]
+impl pkg::InputsPackager for CInputsPackager {
+    fn write_inputs(self: Box<Self>, wtr: &mut io::Write) -> Result<()> {
+        use tar;
+
+        let CInputsPackager { input_path, dist_input_path, preprocessed_input } = *{self};
+
+        let mut builder = tar::Builder::new(wtr);
+
+        let mut file_header = pkg::make_tar_header(&input_path, &dist_input_path)?;
+        file_header.set_size(preprocessed_input.len() as u64); // The metadata is from non-preprocessed
+        file_header.set_cksum();
+        builder.append(&file_header, preprocessed_input.as_slice())?;
+
+        // Finish archive
+        let _ = builder.into_inner();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "dist-client")]
+#[allow(unused)]
+struct CToolchainPackager {
+    executable: PathBuf,
+}
+
+#[cfg(feature = "dist-client")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl pkg::ToolchainPackager for CToolchainPackager {
+    fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
+        use std::env;
+        use std::os::unix::ffi::OsStrExt;
+
+        info!("Packaging C compiler");
+        // TODO: write our own, since this is GPL
+        let curdir = env::current_dir().unwrap();
+        env::set_current_dir("/tmp").unwrap();
+        let output = process::Command::new("icecc-create-env").arg(&self.executable).output().unwrap();
+        if !output.status.success() {
+            println!("{:?}\n\n\n===========\n\n\n{:?}", output.stdout, output.stderr);
+            panic!("failed to create toolchain")
+        }
+        let file_line = output.stdout.split(|&b| b == b'\n').find(|line| line.starts_with(b"creating ")).unwrap();
+        let filename = &file_line[b"creating ".len()..];
+        let filename = OsStr::from_bytes(filename);
+        io::copy(&mut fs::File::open(filename).unwrap(), &mut {f}).unwrap();
+        fs::remove_file(filename).unwrap();
+        env::set_current_dir(curdir).unwrap();
+        Ok(())
     }
 }
 

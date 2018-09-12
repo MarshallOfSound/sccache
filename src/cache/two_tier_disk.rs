@@ -97,6 +97,6 @@ impl Storage for TwoTierDiskCache {
         format!("Local: {} - Remote: {}", self.disk.location(), self.remote.location())
     }
 
-    fn current_size(&self) -> Option<u64> { self.disk.current_size() }
-    fn max_size(&self) -> Option<u64> { self.disk.max_size() }
+    fn current_size(&self) -> SFuture<Option<u64>> { self.disk.current_size() }
+    fn max_size(&self) -> SFuture<Option<u64>> { self.disk.max_size() }
 }

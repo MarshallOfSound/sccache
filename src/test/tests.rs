@@ -21,6 +21,7 @@ use ::commands::{
     request_shutdown,
     request_stats,
 };
+use dist::NoopClient;
 use env_logger;
 use futures::sync::oneshot::{self, Sender};
 use futures_cpupool::CpuPool;
@@ -35,8 +36,10 @@ use std::io::{
     Cursor,
     Write,
 };
+#[cfg(not(target_os="macos"))]
 use std::net::TcpListener;
 use std::path::Path;
+#[cfg(not(target_os="macos"))]
 use std::process::Command;
 use std::sync::{Arc,Mutex,mpsc};
 use std::thread;
@@ -74,6 +77,7 @@ fn run_server_thread<T>(cache_dir: &Path, options: T)
                             .map(|s| *s)
                             .unwrap_or(u64::MAX);
     let pool = CpuPool::new(1);
+    let dist_client = Arc::new(NoopClient);
     let storage = Arc::new(DiskCache::new(&cache_dir, cache_size, &pool));
 
     // Create a server on a background thread, get some useful bits from it.
@@ -82,7 +86,7 @@ fn run_server_thread<T>(cache_dir: &Path, options: T)
     let handle = thread::spawn(move || {
         let core = Core::new().unwrap();
         let client = unsafe { Client::new() };
-        let srv = SccacheServer::new(0, pool, core, client, storage).unwrap();
+        let srv = SccacheServer::new(0, pool, core, client, dist_client, storage).unwrap();
         let mut srv: SccacheServer<Arc<Mutex<MockCommandCreator>>> = srv;
         assert!(srv.port() > 0);
         if let Some(options) = options {
@@ -173,24 +177,21 @@ fn test_server_unsupported_compiler() {
     let exe = &f.bins[0];
     let cmdline = vec!["-c".into(), "file.c".into(), "-o".into(), "file.o".into()];
     let cwd = f.tempdir.path();
+    // This creator shouldn't create any processes. It will assert if
+    // it tries to.
     let client_creator = new_creator();
-    const COMPILER_STDOUT: &'static [u8] = b"some stdout";
-    const COMPILER_STDERR: &'static [u8] = b"some stderr";
-    {
-        let mut c = client_creator.lock().unwrap();
-        // Actual client output.
-        c.next_command_spawns(Ok(MockChild::new(exit_status(0), COMPILER_STDOUT, COMPILER_STDERR)));
-    }
     let mut stdout = Cursor::new(Vec::new());
     let mut stderr = Cursor::new(Vec::new());
     let path = Some(f.paths);
     let mut core = Core::new().unwrap();
-    assert_eq!(0, do_compile(client_creator.clone(), &mut core, conn, exe, cmdline, cwd, path, vec![], &mut stdout, &mut stderr).unwrap());
+    let res = do_compile(client_creator.clone(), &mut core, conn, exe, cmdline, cwd, path, vec![],
+                         &mut stdout, &mut stderr);
+    match res {
+        Ok(_) => panic!("do_compile should have failed!"),
+        Err(e) => assert_eq!("Compiler not supported", e.description()),
+    }
     // Make sure we ran the mock processes.
     assert_eq!(0, server_creator.lock().unwrap().children.len());
-    assert_eq!(0, client_creator.lock().unwrap().children.len());
-    assert_eq!(COMPILER_STDOUT, &stdout.into_inner()[..]);
-    assert_eq!(COMPILER_STDERR, &stderr.into_inner()[..]);
     // Shut down the server.
     sender.send(ServerMessage::Shutdown).ok().unwrap();
     // Ensure that it shuts down.
@@ -199,7 +200,7 @@ fn test_server_unsupported_compiler() {
 
 #[test]
 fn test_server_compile() {
-    match env_logger::init() {
+    match env_logger::try_init() {
         Ok(_) => {},
         Err(_) => {},
     }
@@ -265,7 +266,6 @@ fn test_server_port_in_use() {
         .unwrap();
     assert!(!output.status.success());
     let s = String::from_utf8_lossy(&output.stderr);
-    assert!(s.contains("Server startup failed:"),
-            "Output did not contain 'Failed to start server:':\n========\n{}\n========",
-            s);
+    const MSG: &str = "Server startup failed:";
+    assert!(s.contains(MSG), "Output did not contain '{}':\n========\n{}\n========", MSG, s);
 }

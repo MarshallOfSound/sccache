@@ -14,7 +14,7 @@
 
 use cache::{
     Storage,
-    storage_from_environment,
+    storage_from_config,
 };
 use compiler::{
     CacheControl,
@@ -25,11 +25,13 @@ use compiler::{
     MissType,
     get_compiler_info,
 };
+use config::CONFIG;
+use dist;
 use filetime::FileTime;
 use futures::future;
 use futures::sync::mpsc;
 use futures::task::{self, Task};
-use futures::{Stream, Sink, Async, AsyncSink, Poll, StartSend, Future, IntoFuture};
+use futures::{Stream, Sink, Async, AsyncSink, Poll, StartSend, Future};
 use futures_cpupool::CpuPool;
 use jobserver::Client;
 use mock_command::{
@@ -60,12 +62,23 @@ use tokio_proto::streaming::pipeline::{Frame, ServerProto, Transport};
 use tokio_proto::streaming::{Body, Message};
 use tokio_serde_bincode::{ReadBincode, WriteBincode};
 use tokio_service::Service;
-use util::fmt_duration_as_secs;
+use util; //::fmt_duration_as_secs;
 
 use errors::*;
 
 /// If the server is idle for this many seconds, shut down.
 const DEFAULT_IDLE_TIMEOUT: u64 = 600;
+
+/// Result of background server startup.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ServerStartup {
+    /// Server started successfully on `port`.
+    Ok { port: u16 },
+    /// Timed out waiting for server startup.
+    TimedOut,
+    /// Server encountered an error.
+    Err { reason: String },
+}
 
 /// Get the time the server should idle for before shutting down.
 fn get_idle_timeout() -> u64 {
@@ -76,26 +89,24 @@ fn get_idle_timeout() -> u64 {
         .unwrap_or(DEFAULT_IDLE_TIMEOUT)
 }
 
-fn notify_server_startup_internal<W: Write>(mut w: W, success: bool) -> io::Result<()> {
-    let data = [ if success { 0 } else { 1 }; 1];
-    w.write_all(&data)?;
-    Ok(())
+fn notify_server_startup_internal<W: Write>(mut w: W, status: ServerStartup) -> Result<()> {
+    util::write_length_prefixed_bincode(&mut w, status)
 }
 
 #[cfg(unix)]
-fn notify_server_startup(name: &Option<OsString>, success: bool) -> io::Result<()> {
+fn notify_server_startup(name: &Option<OsString>, status: ServerStartup) -> Result<()> {
     use std::os::unix::net::UnixStream;
     let name = match *name {
         Some(ref s) => s,
         None => return Ok(()),
     };
-    debug!("notify_server_startup(success: {})", success);
+    debug!("notify_server_startup({:?})", status);
     let stream = UnixStream::connect(name)?;
-    notify_server_startup_internal(stream, success)
+    notify_server_startup_internal(stream, status)
 }
 
 #[cfg(windows)]
-fn notify_server_startup(name: &Option<OsString>, success: bool) -> io::Result<()> {
+fn notify_server_startup(name: &Option<OsString>, status: ServerStartup) -> Result<()> {
     use std::fs::OpenOptions;
 
     let name = match *name {
@@ -103,7 +114,7 @@ fn notify_server_startup(name: &Option<OsString>, success: bool) -> io::Result<(
         None => return Ok(()),
     };
     let pipe = try!(OpenOptions::new().write(true).read(true).open(name));
-    notify_server_startup_internal(pipe, success)
+    notify_server_startup_internal(pipe, status)
 }
 
 #[cfg(unix)]
@@ -121,21 +132,49 @@ fn get_signal(_status: ExitStatus) -> i32 {
 /// Spins an event loop handling client connections until a client
 /// requests a shutdown.
 pub fn start_server(port: u16) -> Result<()> {
-    trace!("start_server");
+    info!("start_server: port: {}", port);
     let client = unsafe { Client::new() };
     let core = Core::new()?;
     let pool = CpuPool::new(20);
-    let storage = storage_from_environment(&pool, &core.handle());
-    let res = SccacheServer::<ProcessCommandCreator>::new(port, pool, core, client, storage);
+    let dist_client: Arc<dist::Client> = match CONFIG.dist.scheduler_addr {
+        #[cfg(feature = "dist-client")]
+        Some(addr) => {
+            info!("Enabling distributed sccache to {}", addr);
+            Arc::new(dist::http::Client::new(
+                &core.handle(),
+                &pool,
+                addr,
+                &CONFIG.dist.cache_dir.join("client"),
+                CONFIG.dist.toolchain_cache_size,
+                &CONFIG.dist.custom_toolchains,
+                &CONFIG.dist.auth,
+            ))
+        },
+        #[cfg(not(feature = "dist-client"))]
+        Some(_) => {
+            warn!("Scheduler address configured but dist feature disabled, disabling distributed sccache");
+            Arc::new(dist::NoopClient)
+        },
+        None => {
+            info!("No scheduler address configured, disabling distributed sccache");
+            Arc::new(dist::NoopClient)
+        },
+    };
+    let storage = storage_from_config(&pool, &core.handle());
+    let res = SccacheServer::<ProcessCommandCreator>::new(port, pool, core, client, dist_client, storage);
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
     match res {
         Ok(srv) => {
-            notify_server_startup(&notify, true)?;
+            let port = srv.port();
+            info!("server started, listening on port {}", port);
+            notify_server_startup(&notify, ServerStartup::Ok { port })?;
             srv.run(future::empty::<(), ()>())?;
             Ok(())
         }
         Err(e) => {
-            notify_server_startup(&notify, false)?;
+            error!("failed to start server: {}", e);
+            let reason = e.to_string();
+            notify_server_startup(&notify, ServerStartup::Err { reason })?;
             Err(e)
         }
     }
@@ -155,6 +194,7 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
                pool: CpuPool,
                core: Core,
                client: Client,
+               dist_client: Arc<dist::Client>,
                storage: Arc<Storage>) -> Result<SccacheServer<C>> {
         let handle = core.handle();
         let addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port);
@@ -164,7 +204,8 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
         // connections.
         let (tx, rx) = mpsc::channel(1);
         let (wait, info) = WaitUntilZero::new();
-        let service = SccacheService::new(storage,
+        let service = SccacheService::new(dist_client,
+                                          storage,
                                           core.handle(),
                                           &client,
                                           pool,
@@ -305,6 +346,9 @@ struct SccacheService<C: CommandCreatorSync> {
     /// Server statistics.
     stats: Rc<RefCell<ServerStats>>,
 
+    /// Distributed sccache client
+    dist_client: Arc<dist::Client>,
+
     /// Cache storage.
     storage: Arc<Storage>,
 
@@ -365,7 +409,7 @@ impl<C> Service for SccacheService<C>
         // that every message is received.
         drop(self.tx.clone().start_send(ServerMessage::Request));
 
-        let res = match req.into_inner() {
+        let res: SFuture<Response> = match req.into_inner() {
             Request::Compile(compile) => {
                 debug!("handle_client: compile");
                 self.stats.borrow_mut().compile_requests += 1;
@@ -373,31 +417,34 @@ impl<C> Service for SccacheService<C>
             }
             Request::GetStats => {
                 debug!("handle_client: get_stats");
-                Response::Stats(self.get_info())
+                Box::new(self.get_info().map(Response::Stats))
             }
             Request::ZeroStats => {
                 debug!("handle_client: zero_stats");
                 self.zero_stats();
-                Response::Stats(self.get_info())
+                Box::new(self.get_info().map(Response::Stats))
             }
             Request::Shutdown => {
                 debug!("handle_client: shutdown");
-                let future = self.tx.clone().send(ServerMessage::Shutdown);
-                let info = self.get_info();
-                return Box::new(future.then(move |_| {
-                    Ok(Message::WithoutBody(Response::ShuttingDown(info)))
-                }))
+                let future = self.tx.clone().send(ServerMessage::Shutdown).then(|_| Ok(()));
+                let info_future = self.get_info();
+                return Box::new(future.join(info_future)
+                    .map(move |(_, info)| {
+                        Message::WithoutBody(Response::ShuttingDown(info))
+                    })
+                )
             }
         };
 
-        f_ok(Message::WithoutBody(res))
+        Box::new(res.map(Message::WithoutBody))
     }
 }
 
 impl<C> SccacheService<C>
     where C: CommandCreatorSync,
 {
-    pub fn new(storage: Arc<Storage>,
+    pub fn new(dist_client: Arc<dist::Client>,
+               storage: Arc<Storage>,
                handle: Handle,
                client: &Client,
                pool: CpuPool,
@@ -405,6 +452,7 @@ impl<C> SccacheService<C>
                info: ActiveInfo) -> SccacheService<C> {
         SccacheService {
             stats: Rc::new(RefCell::new(ServerStats::default())),
+            dist_client,
             storage: storage,
             compilers: Rc::new(RefCell::new(HashMap::new())),
             pool: pool,
@@ -416,13 +464,19 @@ impl<C> SccacheService<C>
     }
 
     /// Get info and stats about the cache.
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            stats: self.stats.borrow().clone(),
-            cache_location: self.storage.location(),
-            cache_size: self.storage.current_size(),
-            max_cache_size: self.storage.max_size(),
-        }
+    fn get_info(&self) -> SFuture<ServerInfo> {
+        let stats = self.stats.borrow().clone();
+        let cache_location = self.storage.location();
+        Box::new(self.storage.current_size().join(self.storage.max_size())
+            .map(move |(cache_size, max_cache_size)| {
+                ServerInfo {
+                    stats,
+                    cache_location,
+                    cache_size,
+                    max_cache_size,
+                }
+            })
+        )
     }
 
     /// Zero stats about the cache.
@@ -500,6 +554,9 @@ impl<C> SccacheService<C>
             None => {
                 debug!("check_compiler: Unsupported compiler");
                 stats.requests_unsupported_compiler += 1;
+                return Message::WithoutBody(
+                    Response::Compile(CompileResponse::UnsupportedCompiler)
+                        );
             }
             Some(c) => {
                 debug!("check_compiler: Supported compiler");
@@ -514,9 +571,13 @@ impl<C> SccacheService<C>
                         let res = CompileResponse::CompileStarted;
                         return Message::WithBody(Response::Compile(res), rx)
                     }
-                    CompilerArguments::CannotCache(why) => {
+                    CompilerArguments::CannotCache(why, extra_info) => {
                         //TODO: save counts of why
-                        debug!("parse_arguments: CannotCache({}): {:?}", why, cmd);
+                        if let Some(extra_info) = extra_info {
+                            debug!("parse_arguments: CannotCache({}, {}): {:?}", why, extra_info, cmd)
+                        } else {
+                            debug!("parse_arguments: CannotCache({}): {:?}", why, cmd)
+                        }
                         stats.requests_not_cacheable += 1;
                     }
                     CompilerArguments::NotCompilation => {
@@ -550,7 +611,8 @@ impl<C> SccacheService<C>
         };
         let out_pretty = hasher.output_pretty().into_owned();
         let color_mode = hasher.color_mode();
-        let result = hasher.get_cached_or_compile(self.creator.clone(),
+        let result = hasher.get_cached_or_compile(self.dist_client.clone(),
+                                                  self.creator.clone(),
                                                   self.storage.clone(),
                                                   arguments,
                                                   cwd,
@@ -638,7 +700,7 @@ impl<C> SccacheService<C>
             let send = tx.send(Ok(Response::CompileFinished(res)));
 
             let me = me.clone();
-            let cache_write = cache_write.into_future().then(move |result| {
+            let cache_write = cache_write.then(move |result| {
                 match result {
                     Err(e) => {
                         debug!("Error executing cache write: {}", e);
@@ -648,7 +710,7 @@ impl<C> SccacheService<C>
                     Ok(Some(info)) => {
                         debug!("[{}]: Cache write finished in {}",
                                info.object_file_pretty,
-                               fmt_duration_as_secs(&info.duration));
+                               util::fmt_duration_as_secs(&info.duration));
                         me.stats.borrow_mut().cache_writes += 1;
                         me.stats.borrow_mut().cache_write_duration += info.duration;
                     }
@@ -760,7 +822,7 @@ impl ServerStats {
                     Default::default()
                 };
                 // name, value, suffix length
-                $vec.push(($name, fmt_duration_as_secs(&s), 2));
+                $vec.push(($name, util::fmt_duration_as_secs(&s), 2));
             }};
         }
 

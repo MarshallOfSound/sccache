@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(renamed_and_removed_lints)]
+
 use std::boxed::Box;
+use std::convert;
 use std::error;
 use std::io;
 use std::process;
@@ -27,13 +30,16 @@ use jwt;
 use lru_disk_cache;
 #[cfg(feature = "memcached")]
 use memcached;
-use native_tls;
 #[cfg(feature = "openssl")]
 use openssl;
 use serde_json;
 #[cfg(feature = "redis")]
 use redis;
+#[cfg(feature = "reqwest")]
+use reqwest;
 use tempfile;
+use walkdir;
+use which;
 
 error_chain! {
     foreign_links {
@@ -46,9 +52,10 @@ error_chain! {
         Bincode(bincode::Error);
         Memcached(memcached::proto::Error) #[cfg(feature = "memcached")];
         Redis(redis::RedisError) #[cfg(feature = "redis")];
+        Reqwest(reqwest::Error) #[cfg(feature = "reqwest")];
         StrFromUtf8(::std::string::FromUtf8Error) #[cfg(feature = "gcs")];
         TempfilePersist(tempfile::PersistError);
-        Tls(native_tls::Error);
+        WalkDir(walkdir::Error);
     }
 
     errors {
@@ -58,6 +65,15 @@ error_chain! {
             display("didn't get a successful HTTP status, got `{}`", status)
         }
         ProcessError(output: process::Output)
+        Which(err: which::Error) {
+            display("{}", err)
+        }
+    }
+}
+
+impl From<which::Error> for Error {
+    fn from(err: which::Error) -> Self {
+        Error::from(ErrorKind::Which(err))
     }
 }
 
@@ -86,9 +102,15 @@ macro_rules! ftry {
     ($e:expr) => {
         match $e {
             Ok(v) => v,
-            Err(e) => return Box::new(future::err(e.into())),
+            Err(e) => return Box::new($crate::futures::future::err(e.into())) as SFuture<_>,
         }
     }
+}
+
+pub fn f_res<T, E: convert::Into<Error>>(t: ::std::result::Result<T, E>) -> SFuture<T>
+    where T: 'static,
+{
+    Box::new(future::result(t.map_err(Into::into)))
 }
 
 pub fn f_ok<T>(t: T) -> SFuture<T>
