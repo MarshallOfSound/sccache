@@ -26,6 +26,7 @@ use futures::Future;
 use jobserver::Client;
 use log::Level::Trace;
 use mock_command::{
+    CommandChild,
     CommandCreatorSync,
     ProcessCommandCreator,
     RunCommand,
@@ -50,7 +51,6 @@ use strip_ansi_escapes::Writer;
 use tokio_core::reactor::Core;
 use tokio_io::AsyncRead;
 use tokio_io::io::read_exact;
-use util::run_input_output;
 use which::which_in;
 
 use errors::*;
@@ -439,10 +439,14 @@ fn handle_compile_finished(response: CompileFinished,
                     writer: &mut Write,
                     data: &[u8],
                     color_mode: ColorMode) -> Result<()> {
+        // rustc uses the `termcolor` crate which explicitly checks for TERM=="dumb", so
+        // match that behavior here.
+        let dumb_term = env::var("TERM").map(|v| v == "dumb").unwrap_or(false);
         // If the compiler options explicitly requested color output, or if this output stream
         // is a terminal and the compiler options didn't explicitly request non-color output,
         // then write the compiler output directly.
-        if color_mode == ColorMode::On || (atty::is(stream) && color_mode != ColorMode::Off)  {
+        if color_mode == ColorMode::On ||
+            (!dumb_term && atty::is(stream) && color_mode != ColorMode::Off)  {
             writer.write_all(data)?;
         } else {
             // Remove escape codes (and thus colors) while writing.
@@ -518,23 +522,16 @@ fn handle_compile_response<T>(mut creator: T,
         }
     };
 
-    //TODO: possibly capture output here for testing.
     let mut cmd = creator.new_command_sync(exe);
     cmd.args(&cmdline)
         .current_dir(cwd);
     if log_enabled!(Trace) {
         trace!("running command: {:?}", cmd);
     }
-    match core.run(run_input_output(cmd, None)) {
-        Ok(output) | Err(Error(ErrorKind::ProcessError(output), _)) => {
-            if !output.stdout.is_empty() {
-                stdout.write_all(&output.stdout)?;
-            }
-            if !output.stderr.is_empty() {
-                stderr.write_all(&output.stderr)?;
-            }
-            Ok(output.status.code().unwrap_or_else(|| {
-                if let Some(sig) = status_signal(output.status) {
+    match core.run(cmd.spawn().and_then(|c| c.wait().chain_err(|| "failed to wait for child"))) {
+        Ok(status) => {
+            Ok(status.code().unwrap_or_else(|| {
+                if let Some(sig) = status_signal(status) {
                     println!("Compile terminated by signal {}", sig);
                 }
                 // Arbitrary.
@@ -618,6 +615,72 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             let stats = request_shutdown(server)?;
             stats.print();
         }
+        Command::ZeroStats => {
+            trace!("Command::ZeroStats");
+            let conn = connect_or_start_server(get_port())?;
+            let stats = request_zero_stats(conn).chain_err(|| {
+                "couldn't zero stats on server"
+            })?;
+            stats.print();
+        }
+        #[cfg(feature = "dist-client")]
+        Command::DistAuth => {
+            use config::{self, CONFIG};
+            use dist;
+            use url::Url;
+
+            match &CONFIG.dist.auth {
+                config::DistAuth::Token { .. } => {
+                    info!("No authentication needed for type 'token'")
+                },
+                config::DistAuth::Oauth2CodeGrantPKCE { client_id, auth_url, token_url } => {
+                    let cached_config = config::CachedConfig::load()?;
+
+                    let parsed_auth_url = Url::parse(auth_url).map_err(|_| format!("Failed to parse URL {}", auth_url))?;
+                    let token = dist::client_auth::get_token_oauth2_code_grant_pkce(client_id, parsed_auth_url, token_url)?;
+
+                    cached_config.with_mut(|c| {
+                        c.dist.auth_tokens.insert(auth_url.to_owned(), token);
+                    }).chain_err(|| "Unable to save auth token")?
+                },
+                config::DistAuth::Oauth2Implicit { client_id, auth_url } => {
+                    let cached_config = config::CachedConfig::load()?;
+
+                    let parsed_auth_url = Url::parse(auth_url).map_err(|_| format!("Failed to parse URL {}", auth_url))?;
+                    let token = dist::client_auth::get_token_oauth2_implicit(client_id, parsed_auth_url)?;
+
+                    cached_config.with_mut(|c| {
+                        c.dist.auth_tokens.insert(auth_url.to_owned(), token);
+                    }).chain_err(|| "Unable to save auth token")?
+                },
+            };
+        }
+        #[cfg(not(feature = "dist-client"))]
+        Command::DistAuth => {
+            bail!("Distributed compilation not compiled in, please rebuild with the dist-client feature")
+        }
+        #[cfg(feature = "dist-client")]
+        Command::PackageToolchain(executable, out) => {
+            use compiler;
+            use futures_cpupool::CpuPool;
+
+            trace!("Command::PackageToolchain({})", executable.display());
+            let mut core = Core::new()?;
+            let jobserver = unsafe { Client::new() };
+            let creator = ProcessCommandCreator::new(&core.handle(), &jobserver);
+            let env: Vec<_> = env::vars_os().collect();
+            let pool = CpuPool::new(1);
+            let out_file = File::create(out)?;
+
+            let compiler = compiler::get_compiler_info(&creator, &executable, &env, &pool);
+            let packager = compiler.map(|c| c.get_toolchain_packager());
+            let res = packager.and_then(|p| p.write_pkg(out_file));
+            core.run(res)?
+        }
+        #[cfg(not(feature = "dist-client"))]
+        Command::PackageToolchain(_executable, _out) => {
+            bail!("Toolchain packaging not compiled in, please rebuild with the dist-client feature")
+        }
         Command::Compile { exe, cmdline, cwd, env_vars } => {
             trace!("Command::Compile {{ {:?}, {:?}, {:?} }}", exe, cmdline, cwd);
             let jobserver = unsafe { Client::new() };
@@ -636,14 +699,6 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             return res.chain_err(|| {
                 "failed to execute compile"
             })
-        }
-        Command::ZeroStats => {
-            trace!("Command::ZeroStats");
-            let conn = connect_or_start_server(get_port())?;
-            let stats = request_zero_stats(conn).chain_err(|| {
-                "couldn't zero stats on server"
-            })?;
-            stats.print();
         }
     }
 

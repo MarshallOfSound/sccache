@@ -29,6 +29,7 @@ byteorder = "1.0"
 bytes = "0.4"
 chrono = { version = "0.4", optional = true }
 clap = "2.23.0"
+counted-array = "0.1"
 directories = "1"
 env_logger = "0.5"
 error-chain = { version = "0.12", default-features = false }
@@ -88,8 +89,10 @@ rouille = { version = "2.2", optional = true, default-features = false }
 assert_cmd = "0.9"
 cc = "1.0"
 chrono = "0.4"
+escargot = "0.3"
 itertools = "0.7"
 predicates = "0.9.0"
+selenium-rs = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.3"
@@ -108,14 +111,16 @@ all-windows = ["redis", "s3", "memcached", "azure"]
 azure = ["chrono", "hyper", "rust-crypto", "url"]
 s3 = ["chrono", "hyper", "reqwest", "rust-crypto", "simple-s3"]
 simple-s3 = []
-gcs = ["chrono", "hyper", "jsonwebtoken", "openssl", "url"]
+gcs = ["chrono", "hyper", "jsonwebtoken", "openssl", "reqwest", "url"]
 memcached = ["memcached-rs"]
 # Enable features that require unstable features of Nightly Rust.
 unstable = []
 # Enables distributed support in the sccache client
-dist-client = ["ar", "flate2", "reqwest"]
+dist-client = ["ar", "flate2", "hyper", "reqwest", "rust-crypto", "url"]
 # Enables the sccache-dist binary
-dist-server = ["arraydeque", "crossbeam-utils", "jsonwebtoken", "flate2", "libmount", "nix", "reqwest", "rouille"]
+dist-server = ["arraydeque", "crossbeam-utils", "jsonwebtoken", "flate2", "libmount", "nix", "openssl", "reqwest", "rouille"]
+# Enables dist tests with external requirements
+dist-tests = []
 
 [workspace]
 exclude = ["tests/test-crate"]

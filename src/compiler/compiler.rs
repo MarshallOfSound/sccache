@@ -93,6 +93,9 @@ pub trait Compiler<T>: Send + 'static
 {
     /// Return the kind of compiler.
     fn kind(&self) -> CompilerKind;
+    /// Retrieve a packager
+    #[cfg(feature = "dist-client")]
+    fn get_toolchain_packager(&self) -> Box<pkg::ToolchainPackager>;
     /// Determine whether `arguments` are supported by this compiler.
     fn parse_arguments(&self,
                        arguments: &[OsString],
@@ -260,7 +263,7 @@ pub trait CompilerHasher<T>: fmt::Debug + Send + 'static
                         let mut entry = CacheWrite::new();
                         for (key, path) in &outputs {
                             let mut f = File::open(&path)?;
-                            let mode = get_file_mode(&path)?;
+                            let mode = get_file_mode(&f)?;
                             entry.put_object(key, &mut f, mode).chain_err(|| {
                                 format!("failed to put object `{:?}` in zip", path)
                             })?;
@@ -338,6 +341,7 @@ fn dist_or_local_compile<T>(dist_client: Arc<dist::Client>,
                             -> SFuture<(Cacheable, process::Output)>
         where T: CommandCreatorSync {
     use futures::future;
+    use std::error::Error as StdError;
     use std::io;
 
     debug!("[{}]: Attempting distributed compilation", out_pretty);
@@ -355,10 +359,10 @@ fn dist_or_local_compile<T>(dist_client: Arc<dist::Client>,
                 .map(|(_key, path)| path_transformer.to_dist_assert_abs(&cwd.join(path)))
                 .collect::<Option<_>>()
                 .unwrap();
-            compilation.into_dist_packagers(&mut path_transformer)
-                .map(|packagers| (path_transformer, dist_compile_cmd, packagers, dist_output_paths))
+            compilation.into_dist_packagers(path_transformer)
+                .map(|packagers| (dist_compile_cmd, packagers, dist_output_paths))
         })
-        .and_then(move |(path_transformer, mut dist_compile_cmd, (inputs_packager, toolchain_packager), dist_output_paths)| {
+        .and_then(move |(mut dist_compile_cmd, (inputs_packager, toolchain_packager, outputs_rewriter), dist_output_paths)| {
             debug!("[{}]: Identifying dist toolchain for {:?}", compile_out_pretty2, local_executable);
             // TODO: put on a thread
             let (dist_toolchain, maybe_dist_compile_executable) =
@@ -394,25 +398,30 @@ fn dist_or_local_compile<T>(dist_client: Arc<dist::Client>,
                                 .map_err(Into::into)
                         })
                 })
-                .map(move |jres| {
+                .map(move |(jres, path_transformer)| {
                     let jc = match jres {
                         dist::RunJobResult::Complete(jc) => jc,
                         dist::RunJobResult::JobNotFound => panic!(),
                     };
                     info!("fetched {:?}", jc.outputs.iter().map(|&(ref p, ref bs)| (p, bs.lens().to_string())).collect::<Vec<_>>());
+                    let mut output_paths = vec![];
                     for (path, output_data) in jc.outputs {
                         let len = output_data.lens().actual;
-                        let mut file = File::create(path_transformer.to_local(&path)).unwrap();
+                        let local_path = path_transformer.to_local(&path);
+                        let mut file = File::create(&local_path).unwrap();
                         let count = io::copy(&mut output_data.into_reader(), &mut file).unwrap();
                         assert!(count == len);
+                        output_paths.push((path, local_path))
                     }
+                    outputs_rewriter.handle_outputs(&path_transformer, output_paths).unwrap();
                     jc.output.into()
                 })
             )
         })
         // Something failed, do a local compilation
         .or_else(move |e| {
-            info!("[{}]: Could not perform distributed compile, falling back to local: {}", compile_out_pretty3, e);
+            let cause = e.cause().map(|c| format!(": {}", c)).unwrap_or_else(String::new);
+            info!("[{}]: Could not perform distributed compile, falling back to local: {}{}", compile_out_pretty3, e, cause);
             compile_cmd.execute(&creator)
         })
         .map(move |o| (cacheable, o))
@@ -432,10 +441,9 @@ pub trait Compilation {
                                  -> Result<(CompileCommand, Option<dist::CompileCommand>, Cacheable)>;
 
     /// Create a function that will create the inputs used to perform a distributed compilation
-    // TODO: It's more correct to have a FnBox or Box<FnOnce> here
     #[cfg(feature = "dist-client")]
-    fn into_dist_packagers(self: Box<Self>, _path_transformer: &mut dist::PathTransformer)
-                           -> Result<(Box<pkg::InputsPackager>, Box<pkg::ToolchainPackager>)> {
+    fn into_dist_packagers(self: Box<Self>, _path_transformer: dist::PathTransformer)
+                           -> Result<(Box<pkg::InputsPackager>, Box<pkg::ToolchainPackager>, Box<OutputsRewriter>)> {
 
         bail!("distributed compilation not implemented")
     }
@@ -445,6 +453,22 @@ pub trait Compilation {
     /// Each item is a descriptive (and unique) name of the output paired with
     /// the path where it'll show up.
     fn outputs<'a>(&'a self) -> Box<Iterator<Item=(&'a str, &'a Path)> + 'a>;
+}
+
+#[cfg(feature = "dist-client")]
+pub trait OutputsRewriter {
+    fn handle_outputs(self: Box<Self>, path_transformer: &dist::PathTransformer, output_paths: Vec<(String, PathBuf)>)
+                      -> Result<()>;
+}
+
+#[cfg(feature = "dist-client")]
+pub struct NoopOutputsRewriter;
+#[cfg(feature = "dist-client")]
+impl OutputsRewriter for NoopOutputsRewriter {
+    fn handle_outputs(self: Box<Self>, _path_transformer: &dist::PathTransformer, _output_paths: Vec<(String, PathBuf)>)
+                      -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Result of generating a hash from a compiler command.
@@ -566,14 +590,14 @@ impl PartialEq<CompileResult> for CompileResult {
 }
 
 #[cfg(unix)]
-fn get_file_mode(path: &Path) -> Result<Option<u32>>
+fn get_file_mode(file: &File) -> Result<Option<u32>>
 {
     use std::os::unix::fs::MetadataExt;
-    Ok(Some(fs::metadata(path)?.mode()))
+    Ok(Some(file.metadata()?.mode()))
 }
 
 #[cfg(windows)]
-fn get_file_mode(_path: &Path) -> Result<Option<u32>>
+fn get_file_mode(_file: &File) -> Result<Option<u32>>
 {
     Ok(None)
 }
@@ -641,14 +665,14 @@ fn detect_compiler<T>(creator: &T,
                       -> SFuture<Option<Box<Compiler<T>>>>
     where T: CommandCreatorSync
 {
-    trace!("detect_compiler");
+    trace!("detect_compiler: {}", executable.display());
 
     // First, see if this looks like rustc.
     let filename = match executable.file_stem() {
         None => return f_err("could not determine compiler kind"),
         Some(f) => f,
     };
-    let is_rustc = if filename.to_string_lossy().to_lowercase() == "rustc" {
+    let rustc_vv = if filename.to_string_lossy().to_lowercase() == "rustc" {
         // Sanity check that it's really rustc.
         let executable = executable.to_path_buf();
         let child = creator.clone().new_command_sync(&executable)
@@ -656,7 +680,7 @@ fn detect_compiler<T>(creator: &T,
             .stderr(Stdio::null())
             .env_clear()
             .envs(ref_env(env))
-            .args(&["--version"])
+            .args(&["-vV"])
             .spawn();
         let output = child.and_then(move |child| {
             child.wait_with_output()
@@ -666,24 +690,24 @@ fn detect_compiler<T>(creator: &T,
             if output.status.success() {
                 if let Ok(stdout) = String::from_utf8(output.stdout) {
                     if stdout.starts_with("rustc ") {
-                        return true;
+                        return Some(stdout)
                     }
                 }
             }
-            false
+            None
         }))
     } else {
-        f_ok(false)
+        f_ok(None)
     };
 
     let creator = creator.clone();
     let executable = executable.to_owned();
     let env = env.to_owned();
     let pool = pool.clone();
-    Box::new(is_rustc.and_then(move |is_rustc| {
-        if is_rustc {
+    Box::new(rustc_vv.and_then(move |rustc_vv| {
+        if let Some(rustc_verbose_version) = rustc_vv {
             debug!("Found rustc");
-            Box::new(Rust::new(creator, executable, &env, pool)
+            Box::new(Rust::new(creator, executable, &env, &rustc_verbose_version, pool)
                 .map(|c| Some(Box::new(c) as Box<Compiler<T>>)))
         } else {
             detect_c_compiler(creator, executable, env, pool)
@@ -854,8 +878,15 @@ mod test {
         let rustc = f.mk_bin("rustc").unwrap();
         let creator = new_creator();
         let pool = CpuPool::new(1);
-        // rustc --version
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "rustc 1.15 (blah 2017-01-01)", "")));
+        // rustc --vV
+        next_command(&creator, Ok(MockChild::new(exit_status(0), "\
+rustc 1.27.0 (3eda71b00 2018-06-19)
+binary: rustc
+commit-hash: 3eda71b00ad48d7bf4eef4c443e7f611fd061418
+commit-date: 2018-06-19
+host: x86_64-unknown-linux-gnu
+release: 1.27.0
+LLVM version: 6.0", "")));
         // rustc --print=sysroot
         let sysroot = f.tempdir.path().to_str().unwrap();
         next_command(&creator, Ok(MockChild::new(exit_status(0), &sysroot, "")));

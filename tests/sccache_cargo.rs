@@ -6,6 +6,7 @@
 extern crate assert_cmd;
 extern crate chrono;
 extern crate env_logger;
+extern crate escargot;
 #[cfg(not(target_os="macos"))]
 #[macro_use]
 extern crate log;
@@ -17,19 +18,36 @@ extern crate tempdir;
 #[test]
 #[cfg(not(target_os="macos"))] // test currently fails on macos
 fn test_rust_cargo() {
+    test_rust_cargo_cmd("check");
+    test_rust_cargo_cmd("build");
+}
+
+#[cfg(not(target_os="macos"))] // test currently fails on macos
+fn test_rust_cargo_cmd(cmd: &str) {
     use std::env;
     use std::io::Write;
     use std::fs;
     use std::path::Path;
     use assert_cmd::prelude::*;
     use chrono::Local;
+    use escargot::CargoBuild;
     use predicates::prelude::*;
     use std::process::{Command, Stdio};
     use tempdir::TempDir;
 
+    fn sccache_command() -> Command {
+        CargoBuild::new()
+            .bin("sccache")
+            .current_release()
+            .current_target()
+            .run()
+            .unwrap()
+            .command()
+    }
+
     fn stop() {
         trace!("sccache --stop-server");
-        drop(Command::main_binary().unwrap()
+        drop(sccache_command()
             .arg("--stop-server")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -47,7 +65,7 @@ fn test_rust_cargo() {
              )
          })
         .parse(&env::var("RUST_LOG").unwrap_or_default())
-        .init());
+        .try_init());
     let cargo = env!("CARGO");
     debug!("cargo: {}", cargo);
     #[allow(deprecated)]
@@ -64,7 +82,7 @@ fn test_rust_cargo() {
     fs::create_dir(&cargo_dir).unwrap();
     // Start a new sccache server.
     trace!("sccache --start-server");
-    Command::main_binary().unwrap()
+    sccache_command()
         .arg("--start-server")
         .env("SCCACHE_DIR", &cache_dir)
         .assert()
@@ -80,7 +98,7 @@ fn test_rust_cargo() {
         .success();
     // Now build the crate with cargo.
     Command::new(&cargo)
-        .args(&["build", "--color=never"])
+        .args(&[cmd, "--color=never"])
         .envs(envs.iter().map(|v| *v))
         .current_dir(&crate_dir)
         .assert()
@@ -94,7 +112,7 @@ fn test_rust_cargo() {
         .assert()
         .success();
     Command::new(&cargo)
-        .args(&["build", "--color=always"])
+        .args(&[cmd, "--color=always"])
         .envs(envs.iter().map(|v| *v))
         .current_dir(&crate_dir)
         .assert()
@@ -105,7 +123,7 @@ fn test_rust_cargo() {
     // so there are two separate compilations, but cargo will build the test crate with
     // incremental compilation enabled, so sccache will not cache it.
     trace!("sccache --show-stats");
-    Command::main_binary().unwrap()
+    sccache_command()
         .args(&["--show-stats", "--stats-format=json"])
         .assert()
         .stdout(predicates::str::contains(r#""cache_hits":1"#).from_utf8())

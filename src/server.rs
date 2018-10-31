@@ -25,7 +25,7 @@ use compiler::{
     MissType,
     get_compiler_info,
 };
-use config::CONFIG;
+use config::{self, CONFIG};
 use dist;
 use filetime::FileTime;
 use futures::future;
@@ -140,14 +140,29 @@ pub fn start_server(port: u16) -> Result<()> {
         #[cfg(feature = "dist-client")]
         Some(addr) => {
             info!("Enabling distributed sccache to {}", addr);
+            let auth_token = match &CONFIG.dist.auth {
+                config::DistAuth::Token { token } => token.to_owned(),
+                config::DistAuth::Oauth2CodeGrantPKCE { client_id: _, auth_url, token_url: _ } => {
+                    let cached_config = config::CachedConfig::load().unwrap();
+                    cached_config.with(|c| {
+                        c.dist.auth_tokens.get(auth_url).unwrap().to_owned()
+                    })
+                },
+                config::DistAuth::Oauth2Implicit { client_id: _, auth_url } => {
+                    let cached_config = config::CachedConfig::load().unwrap();
+                    cached_config.with(|c| {
+                        c.dist.auth_tokens.get(auth_url).unwrap().to_owned()
+                    })
+                },
+            };
             Arc::new(dist::http::Client::new(
                 &core.handle(),
                 &pool,
                 addr,
                 &CONFIG.dist.cache_dir.join("client"),
                 CONFIG.dist.toolchain_cache_size,
-                &CONFIG.dist.custom_toolchains,
-                &CONFIG.dist.auth,
+                &CONFIG.dist.toolchains,
+                auth_token,
             ))
         },
         #[cfg(not(feature = "dist-client"))]
@@ -572,13 +587,13 @@ impl<C> SccacheService<C>
                         return Message::WithBody(Response::Compile(res), rx)
                     }
                     CompilerArguments::CannotCache(why, extra_info) => {
-                        //TODO: save counts of why
                         if let Some(extra_info) = extra_info {
                             debug!("parse_arguments: CannotCache({}, {}): {:?}", why, extra_info, cmd)
                         } else {
                             debug!("parse_arguments: CannotCache({}): {:?}", why, cmd)
                         }
                         stats.requests_not_cacheable += 1;
+                        *stats.not_cached.entry(why.to_string()).or_insert(0) += 1;
                     }
                     CompilerArguments::NotCompilation => {
                         debug!("parse_arguments: NotCompilation: {:?}", cmd);
@@ -766,6 +781,8 @@ pub struct ServerStats {
     pub cache_read_miss_duration: Duration,
     /// The count of compilation failures.
     pub compile_fails: u64,
+    /// Counts of reasons why compiles were not cached.
+    pub not_cached: HashMap<String, usize>,
 }
 
 /// Info and stats about the server.
@@ -798,6 +815,7 @@ impl Default for ServerStats {
             cache_read_hit_duration: Duration::new(0, 0),
             cache_read_miss_duration: Duration::new(0, 0),
             compile_fails: u64::default(),
+            not_cached: HashMap::new(),
         }
     }
 }
@@ -850,6 +868,14 @@ impl ServerStats {
         for (name, stat, suffix_len) in stats_vec {
             println!("{:<name_width$} {:>stat_width$}", name, stat, name_width=name_width, stat_width=stat_width + suffix_len);
         }
+        if !self.not_cached.is_empty() {
+            println!("\nNon-cacheable reasons:");
+            for (reason, count) in self.not_cached.iter() {
+                println!("{:<name_width$} {:>stat_width$}", reason, count, name_width=name_width,
+                         stat_width=stat_width);
+            }
+            println!("");
+        }
         (name_width, stat_width)
     }
 }
@@ -866,7 +892,8 @@ impl ServerInfo {
                     Standalone(bytes) => (bytes.to_string(), "bytes".to_string()),
                     Prefixed(prefix, n) => (format!("{:.0}", n), format!("{}B", prefix)),
                 };
-                println!("{:<name_width$} {:>stat_width$} {}", name, val, suffix, name_width=name_width, stat_width=stat_width);
+                println!("{:<name_width$} {:>stat_width$} {}", name, val, suffix,
+                         name_width=name_width, stat_width=stat_width);
             }
         }
     }

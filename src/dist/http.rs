@@ -16,7 +16,7 @@
 #[cfg(feature = "dist-client")]
 pub use self::client::Client;
 #[cfg(feature = "dist-server")]
-pub use self::server::Scheduler;
+pub use self::server::{Scheduler, ClientAuthCheck, ServerAuthCheck};
 #[cfg(feature = "dist-server")]
 pub use self::server::Server;
 
@@ -181,8 +181,11 @@ mod server {
     };
     use errors::*;
 
+    pub type ClientAuthCheck = Box<Fn(&str) -> bool + Send + Sync>;
+    pub type ServerAuthCheck = Box<Fn(&str) -> Option<ServerId> + Send + Sync>;
+
     const JWT_KEY_LENGTH: usize = 256 / 8;
-    lazy_static!{
+    lazy_static! {
         static ref JWT_HEADER: jwt::Header = jwt::Header::new(jwt::Algorithm::HS256);
         static ref JWT_VALIDATION: jwt::Validation = jwt::Validation {
             leeway: 0,
@@ -356,13 +359,13 @@ mod server {
     pub struct Scheduler<S> {
         handler: S,
         // Is this client permitted to use the scheduler?
-        check_client_auth: Box<Fn(&str) -> bool + Send + Sync>,
+        check_client_auth: ClientAuthCheck,
         // Do we believe the server is who they appear to be?
-        check_server_auth: Box<Fn(&str) -> Option<ServerId> + Send + Sync>,
+        check_server_auth: ServerAuthCheck,
     }
 
     impl<S: dist::SchedulerIncoming + 'static> Scheduler<S> {
-        pub fn new(handler: S, check_client_auth: Box<Fn(&str) -> bool + Send + Sync>, check_server_auth: Box<Fn(&str) -> Option<ServerId> + Send + Sync>) -> Self {
+        pub fn new(handler: S, check_client_auth: ClientAuthCheck, check_server_auth: ServerAuthCheck) -> Self {
             Self { handler, check_client_auth, check_server_auth }
         }
 
@@ -566,6 +569,7 @@ mod client {
     use bincode;
     use byteorder::{BigEndian, WriteBytesExt};
     use config;
+    use dist::PathTransformer;
     use dist::pkg::{InputsPackager, ToolchainPackager};
     use flate2::Compression;
     use flate2::write::ZlibEncoder as ZlibWriteEncoder;
@@ -598,7 +602,7 @@ mod client {
     const REQUEST_TIMEOUT_SECS: u64 = 600;
 
     pub struct Client {
-        auth: &'static config::DistAuth,
+        auth_token: String,
         scheduler_addr: SocketAddr,
         // TODO: this should really only use the async client, but reqwest async bodies are extremely limited
         // and only support owned bytes, which means the whole toolchain would end up in memory
@@ -609,28 +613,25 @@ mod client {
     }
 
     impl Client {
-        pub fn new(handle: &tokio_core::reactor::Handle, pool: &CpuPool, scheduler_addr: IpAddr, cache_dir: &Path, cache_size: u64, custom_toolchains: &[config::DistCustomToolchain], auth: &'static config::DistAuth) -> Self {
+        pub fn new(handle: &tokio_core::reactor::Handle, pool: &CpuPool, scheduler_addr: IpAddr, cache_dir: &Path, cache_size: u64, toolchain_configs: &[config::DistToolchainConfig], auth_token: String) -> Self {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let client = reqwest::ClientBuilder::new().timeout(timeout).build().unwrap();
             let client_async = reqwest::unstable::async::ClientBuilder::new().timeout(timeout).build(handle).unwrap();
             Self {
-                auth,
+                auth_token,
                 scheduler_addr: Cfg::scheduler_connect_addr(scheduler_addr),
                 client,
                 client_async,
                 pool: pool.clone(),
-                tc_cache: cache::ClientToolchains::new(cache_dir, cache_size, custom_toolchains),
+                tc_cache: cache::ClientToolchains::new(cache_dir, cache_size, toolchain_configs),
             }
         }
     }
 
     impl dist::Client for Client {
         fn do_alloc_job(&self, tc: Toolchain) -> SFuture<AllocJobResult> {
-            let token = match self.auth {
-                config::DistAuth::Token { token } => token,
-            };
             let url = format!("http://{}/api/v1/scheduler/alloc_job", self.scheduler_addr);
-            Box::new(f_res(self.client_async.post(&url).bearer_auth(token.to_owned()).bincode(&tc).map(bincode_req_fut)).and_then(|r| r))
+            Box::new(f_res(self.client_async.post(&url).bearer_auth(self.auth_token.clone()).bincode(&tc).map(bincode_req_fut)).and_then(|r| r))
         }
         fn do_submit_toolchain(&self, job_alloc: JobAlloc, tc: Toolchain) -> SFuture<SubmitToolchainResult> {
             if let Some(toolchain_file) = self.tc_cache.get_toolchain(&tc) {
@@ -645,7 +646,7 @@ mod client {
                 f_err("couldn't find toolchain locally")
             }
         }
-        fn do_run_job(&self, job_alloc: JobAlloc, command: CompileCommand, outputs: Vec<String>, inputs_packager: Box<InputsPackager>) -> SFuture<RunJobResult> {
+        fn do_run_job(&self, job_alloc: JobAlloc, command: CompileCommand, outputs: Vec<String>, inputs_packager: Box<InputsPackager>) -> SFuture<(RunJobResult, PathTransformer)> {
             let url = format!("http://{}/api/v1/distserver/run_job/{}", job_alloc.server_id.addr(), job_alloc.job_id);
             let mut req = self.client.post(&url);
 
@@ -656,16 +657,17 @@ mod client {
                 let mut body = vec![];
                 body.write_u32::<BigEndian>(bincode_length as u32).unwrap();
                 body.write(&bincode).unwrap();
+                let path_transformer;
                 {
                     let mut compressor = ZlibWriteEncoder::new(&mut body, Compression::fast());
-                    inputs_packager.write_inputs(&mut compressor).chain_err(|| "Could not write inputs for compilation")?;
+                    path_transformer = inputs_packager.write_inputs(&mut compressor).chain_err(|| "Could not write inputs for compilation")?;
                     compressor.flush().unwrap();
                     trace!("Compressed inputs from {} -> {}", compressor.total_in(), compressor.total_out());
                     compressor.finish().unwrap();
                 }
 
                 req.bearer_auth(job_alloc.auth.clone()).bytes(body);
-                bincode_req(&mut req)
+                bincode_req(&mut req).map(|res| (res, path_transformer))
             }))
         }
 

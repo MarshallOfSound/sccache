@@ -19,6 +19,7 @@
 extern crate assert_cmd;
 extern crate cc;
 extern crate env_logger;
+extern crate escargot;
 #[macro_use]
 extern crate log;
 extern crate predicates;
@@ -28,6 +29,7 @@ extern crate tempdir;
 extern crate which;
 
 use assert_cmd::prelude::*;
+use escargot::CargoBuild;
 use log::Level::Trace;
 use predicates::prelude::*;
 use sccache::server::ServerInfo;
@@ -64,9 +66,19 @@ const COMPILERS: &'static [&'static str] = &["clang"];
 
 //TODO: could test gcc when targeting mingw.
 
+fn sccache_command() -> Command {
+    CargoBuild::new()
+        .bin("sccache")
+        .current_release()
+        .current_target()
+        .run()
+        .unwrap()
+        .command()
+}
+
 fn stop() {
     trace!("sccache --stop-server");
-    drop(Command::main_binary().unwrap()
+    drop(sccache_command()
          .arg("--stop-server")
          .stdout(Stdio::null())
          .stderr(Stdio::null())
@@ -75,7 +87,7 @@ fn stop() {
 
 fn zero_stats() {
     trace!("sccache --zero-stats");
-    drop(Command::main_binary().unwrap()
+    drop(sccache_command()
          .arg("--zero-stats")
          .stdout(Stdio::null())
          .stderr(Stdio::null())
@@ -97,7 +109,7 @@ fn compile_cmdline<T: AsRef<OsStr>>(compiler: &str, exe: T, input: &str, output:
 }
 
 fn get_stats<F: 'static + Fn(ServerInfo)>(f: F) {
-    Command::main_binary().unwrap()
+    sccache_command()
         .args(&["--show-stats", "--stats-format=json"])
         .assert()
         .success()
@@ -132,7 +144,7 @@ fn test_basic_compile(compiler: Compiler, tempdir: &Path) {
 
     let out_file = tempdir.join("test.o");
     trace!("compile");
-    Command::main_binary().unwrap()
+    sccache_command()
         .args(&compile_cmdline(name, &exe, INPUT, OUTPUT))
         .current_dir(tempdir)
         .envs(env_vars.clone())
@@ -148,7 +160,7 @@ fn test_basic_compile(compiler: Compiler, tempdir: &Path) {
     });
     trace!("compile");
     fs::remove_file(&out_file).unwrap();
-    Command::main_binary().unwrap()
+    sccache_command()
         .args(&compile_cmdline(name, &exe, INPUT, OUTPUT))
         .current_dir(tempdir)
 .envs(env_vars.clone())
@@ -164,13 +176,40 @@ fn test_basic_compile(compiler: Compiler, tempdir: &Path) {
     });
 }
 
+fn test_noncacheable_stats(compiler: Compiler, tempdir: &Path) {
+    let Compiler { name, exe, env_vars } = compiler;
+    trace!("test_noncacheable_stats: {}", name);
+    // Copy the source file into the tempdir so we can compile with relative paths, since the commandline winds up in the hash key.
+    let original_source_file = Path::new(file!()).parent().unwrap().join(INPUT);
+    let source_file = tempdir.join(INPUT);
+    trace!("fs::copy({:?}, {:?})", original_source_file, source_file);
+    fs::copy(&original_source_file, &source_file).unwrap();
+
+    trace!("compile");
+    Command::main_binary().unwrap()
+        .arg(&exe)
+        .arg("-E")
+        .arg(INPUT)
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    trace!("request stats");
+    get_stats(|info| {
+        assert_eq!(1, info.stats.compile_requests);
+        assert_eq!(0, info.stats.requests_executed);
+        assert_eq!(1, info.stats.not_cached.len());
+        assert_eq!(Some(&1), info.stats.not_cached.get("-E"));
+    });
+}
+
 fn test_msvc_deps(compiler: Compiler, tempdir: &Path) {
     let Compiler { name, exe, env_vars } = compiler;
     // Check that -deps works.
     trace!("compile with -deps");
     let mut args = compile_cmdline(name, &exe, INPUT, OUTPUT);
     args.push("-depstest.d".into());
-    Command::main_binary().unwrap()
+    sccache_command()
         .args(&args)
         .current_dir(tempdir)
         .envs(env_vars.clone())
@@ -194,7 +233,7 @@ fn test_gcc_mp_werror(compiler: Compiler, tempdir: &Path) {
     let mut args = compile_cmdline(name, &exe, INPUT_ERR, OUTPUT);
     args.extend(vec_from!(OsString, "-MD", "-MP", "-MF", "foo.pp", "-Werror"));
     // This should fail, but the error should be from the #error!
-    Command::main_binary().unwrap()
+    sccache_command()
         .args(&args)
         .current_dir(tempdir)
         .envs(env_vars.clone())
@@ -221,7 +260,7 @@ int main(int argc, char** argv) {
     let mut args = compile_cmdline(name, &exe, SRC, OUTPUT);
     args.extend(vec_from!(OsString, "-fprofile-generate"));
     trace!("compile source.c (1)");
-    Command::main_binary().unwrap()
+    sccache_command()
         .args(&args)
         .current_dir(tempdir)
         .envs(env_vars.clone())
@@ -233,7 +272,7 @@ int main(int argc, char** argv) {
     });
     // Compile the same source again to ensure we can get a cache hit.
     trace!("compile source.c (2)");
-    Command::main_binary().unwrap()
+    sccache_command()
         .args(&args)
         .current_dir(tempdir)
         .envs(env_vars.clone())
@@ -257,7 +296,7 @@ int main(int argc, char** argv) {
 }
 ");
     trace!("compile source.c (3)");
-    Command::main_binary().unwrap()
+    sccache_command()
         .args(&args)
         .current_dir(tempdir)
         .envs(env_vars.clone())
@@ -338,7 +377,7 @@ fn test_sccache_command() {
         trace!("start server");
         // Don't run this with run() because on Windows `wait_with_output`
         // will hang because the internal server process is not detached.
-        Command::main_binary().unwrap()
+        sccache_command()
             .arg("--start-server")
             .env("SCCACHE_DIR", &cache)
             .status()

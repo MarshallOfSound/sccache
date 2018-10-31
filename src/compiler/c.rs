@@ -14,6 +14,8 @@
 
 use compiler::{Cacheable, ColorMode, Compiler, CompilerArguments, CompileCommand, CompilerHasher, CompilerKind,
                Compilation, HashResult};
+#[cfg(feature = "dist-client")]
+use compiler::{NoopOutputsRewriter, OutputsRewriter};
 use dist;
 #[cfg(feature = "dist-client")]
 use dist::pkg;
@@ -189,6 +191,10 @@ impl <I> CCompiler<I>
 
 impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
     fn kind(&self) -> CompilerKind { CompilerKind::C(self.compiler.kind()) }
+    #[cfg(feature = "dist-client")]
+    fn get_toolchain_packager(&self) -> Box<pkg::ToolchainPackager> {
+        Box::new(CToolchainPackager { executable: self.executable.clone() })
+    }
     fn parse_arguments(&self,
                        arguments: &[OsString],
                        cwd: &Path) -> CompilerArguments<Box<CompilerHasher<T> + 'static>> {
@@ -305,17 +311,15 @@ impl<I: CCompilerImpl> Compilation for CCompilation<I> {
     }
 
     #[cfg(feature = "dist-client")]
-    fn into_dist_packagers(self: Box<Self>, path_transformer: &mut dist::PathTransformer) -> Result<(Box<pkg::InputsPackager>, Box<pkg::ToolchainPackager>)> {
+    fn into_dist_packagers(self: Box<Self>, path_transformer: dist::PathTransformer) -> Result<(Box<pkg::InputsPackager>, Box<pkg::ToolchainPackager>, Box<OutputsRewriter>)> {
         let CCompilation { parsed_args, cwd, preprocessed_input, executable, .. } = *{self};
         trace!("Dist inputs: {:?}", parsed_args.input);
 
         let input_path = cwd.join(&parsed_args.input);
-        let input_path = pkg::simplify_path(&input_path)?;
-        let dist_input_path = path_transformer.to_dist(&input_path).unwrap();
-
-        let inputs_packager = Box::new(CInputsPackager { input_path, dist_input_path, preprocessed_input });
+        let inputs_packager = Box::new(CInputsPackager { input_path, preprocessed_input, path_transformer });
         let toolchain_packager = Box::new(CToolchainPackager { executable });
-        Ok((inputs_packager, toolchain_packager))
+        let outputs_rewriter = Box::new(NoopOutputsRewriter);
+        Ok((inputs_packager, toolchain_packager, outputs_rewriter))
     }
 
     fn outputs<'a>(&'a self) -> Box<Iterator<Item=(&'a str, &'a Path)> + 'a>
@@ -327,16 +331,19 @@ impl<I: CCompilerImpl> Compilation for CCompilation<I> {
 #[cfg(feature = "dist-client")]
 struct CInputsPackager {
     input_path: PathBuf,
-    dist_input_path: String,
+    path_transformer: dist::PathTransformer,
     preprocessed_input: Vec<u8>,
 }
 
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for CInputsPackager {
-    fn write_inputs(self: Box<Self>, wtr: &mut io::Write) -> Result<()> {
+    fn write_inputs(self: Box<Self>, wtr: &mut io::Write) -> Result<dist::PathTransformer> {
         use tar;
 
-        let CInputsPackager { input_path, dist_input_path, preprocessed_input } = *{self};
+        let CInputsPackager { input_path, mut path_transformer, preprocessed_input } = *{self};
+
+        let input_path = pkg::simplify_path(&input_path)?;
+        let dist_input_path = path_transformer.to_dist(&input_path).unwrap();
 
         let mut builder = tar::Builder::new(wtr);
 
@@ -347,7 +354,7 @@ impl pkg::InputsPackager for CInputsPackager {
 
         // Finish archive
         let _ = builder.into_inner();
-        Ok(())
+        Ok(path_transformer)
     }
 }
 
@@ -364,7 +371,7 @@ impl pkg::ToolchainPackager for CToolchainPackager {
         use std::env;
         use std::os::unix::ffi::OsStrExt;
 
-        info!("Packaging C compiler");
+        info!("Packaging C compiler for executable {}", self.executable.display());
         // TODO: write our own, since this is GPL
         let curdir = env::current_dir().unwrap();
         env::set_current_dir("/tmp").unwrap();

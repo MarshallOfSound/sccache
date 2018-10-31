@@ -97,7 +97,7 @@ ArgData!{ pub
 use self::ArgData::*;
 
 // Mostly taken from https://github.com/ccache/ccache/blob/master/src/compopt.c#L32-L84
-pub static ARGS: [ArgInfo<ArgData>; 65] = [
+counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     flag!("-", TooHardFlag),
     flag!("--coverage", Coverage),
     take_arg!("--param", OsString, Separated, PassThrough),
@@ -163,7 +163,7 @@ pub static ARGS: [ArgInfo<ArgData>; 65] = [
     take_arg!("-u", OsString, CanBeSeparated, PassThrough),
     take_arg!("-x", OsString, CanBeSeparated, Language),
     take_arg!("@", OsString, Concatenated, TooHard),
-];
+]);
 
 /// Parse `arguments`, determining whether it is supported.
 ///
@@ -402,6 +402,9 @@ pub fn generate_compile_commands(path_transformer: &mut dist::PathTransformer,
                                 env_vars: &[(OsString, OsString)])
                                 -> Result<(CompileCommand, Option<dist::CompileCommand>, Cacheable)>
 {
+    #[cfg(not(feature = "dist-client"))]
+    let _ = path_transformer;
+
     trace!("compile");
 
     let out_file = match parsed_args.outputs.get("obj") {
@@ -434,6 +437,9 @@ pub fn generate_compile_commands(path_transformer: &mut dist::PathTransformer,
         cwd: cwd.to_owned(),
     };
 
+    #[cfg(not(feature = "dist-client"))]
+    let dist_command = None;
+    #[cfg(feature = "dist-client")]
     let dist_command = (|| {
         // https://gcc.gnu.org/onlinedocs/gcc-4.9.0/gcc/Overall-Options.html
         let language = match parsed_args.language {
