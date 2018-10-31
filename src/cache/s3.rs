@@ -29,6 +29,7 @@ use simples3::{
     ProvideAwsCredentials,
     Ssl,
 };
+use std::env;
 use std::io;
 use std::rc::Rc;
 use std::time::{Instant, Duration};
